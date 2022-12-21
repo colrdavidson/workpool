@@ -1,1 +1,1 @@
-clang -g -o pool -lpthread main.c
+clang -g -O3 -o pool -ldl -lpthread -rdynamic -finstrument-functions main.c

@@ -1,8 +1,12 @@
+#include "spall_auto.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <sched.h>
+
 
 typedef ssize_t tpool_task_proc(void *data);
 typedef struct TPoolTask {
@@ -17,7 +21,9 @@ typedef struct Thread {
 
 	TPoolTask *queue;
 	pthread_mutex_t queue_lock;
-	_Atomic int64_t queue_len;
+
+	_Atomic uint64_t tasks_done;
+	_Atomic uint64_t tasks_total;
 
 	struct TPool *pool;
 } Thread;
@@ -28,7 +34,6 @@ typedef struct TPool {
 	int thread_count;
 	bool running;
 
-	// if these wrap, you're doing it wrong.
 	_Atomic uint64_t tasks_done;
 	_Atomic uint64_t tasks_total;
 } TPool;
@@ -36,69 +41,94 @@ typedef struct TPool {
 _Thread_local Thread *current_thread = NULL;
 _Thread_local int work_count = 0;
 
-void tqueue_push(Thread *thread, TPoolTask *task) {
-	thread->queue_len += 1;
-	thread->pool->tasks_total++;
+void mutex_init(pthread_mutex_t *mut) {
+	pthread_mutex_init(mut, NULL);
+}
+void mutex_lock(pthread_mutex_t *mut) {
+	pthread_mutex_lock(mut);
+}
+void mutex_unlock(pthread_mutex_t *mut) {
+	pthread_mutex_unlock(mut);
+}
 
-	printf("pushing task onto thread %d\n", thread->idx);
+void tqueue_push(Thread *thread, TPoolTask *task) {
 	if (!thread->queue) {
 		thread->queue = task;
-		return;
+		goto end;
 	}
 
 	TPoolTask *old_head = thread->queue;
 	task->next = old_head;
 	thread->queue = task;
+
+end:
+	thread->tasks_total++;
+	thread->pool->tasks_total++;
 }
 
 void tqueue_push_safe(Thread *thread, TPoolTask *task) {
-	pthread_mutex_lock(&current_thread->queue_lock);
+	mutex_lock(&thread->queue_lock);
 	tqueue_push(thread, task);
-	pthread_mutex_unlock(&current_thread->queue_lock);
+	mutex_unlock(&thread->queue_lock);
 }
 
 TPoolTask *tqueue_pop(Thread *thread) {
-	if (thread->queue) {
-		TPoolTask *task = thread->queue;
-		thread->queue = task->next;
-
-		thread->queue_len -= 1;
-		return task;
+	if (!thread->queue) {
+		return NULL;
 	}
 
-	return NULL;
+	TPoolTask *task = thread->queue;
+	thread->queue = task->next;
+	return task;
 }
 
 TPoolTask *tqueue_pop_safe(Thread *thread) {
-	pthread_mutex_lock(&current_thread->queue_lock);
+	mutex_lock(&thread->queue_lock);
 	TPoolTask *task = tqueue_pop(thread);
-	pthread_mutex_unlock(&current_thread->queue_lock);
+	mutex_unlock(&thread->queue_lock);
 	return task;
 }
 
 void *tpool_worker(void *ptr) {
 	current_thread = (Thread *)ptr;
+	spall_auto_thread_init(current_thread->idx, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
 	for (;;) {
 		if (!current_thread->pool->running) {
 			break;
 		}
+		while (current_thread->tasks_done < current_thread->tasks_total) {
+			uint64_t stale_done = current_thread->tasks_done;
+			uint64_t stale_total = current_thread->tasks_total;
 
-		TPoolTask *task = tqueue_pop_safe(current_thread);
-		if (!task) {
-			continue;
+			TPoolTask *task = tqueue_pop_safe(current_thread);
+			if (!task) {
+				printf("WTF! %lu, %lu\n", stale_done, stale_total);
+				exit(0);
+			}
+
+			task->do_work(task->args);
+			free(task);
+			current_thread->pool->tasks_done++;
+			current_thread->tasks_done++;
 		}
-
-		task->do_work(task->args);
-		current_thread->pool->tasks_done++;
+		if (current_thread->tasks_done == current_thread->tasks_total) {
+			sched_yield();
+		}
 	}
 
+	spall_auto_thread_quit();
 	return NULL;
+}
+void thread_start(Thread *thread) {
+	pthread_create(&thread->thread, NULL, tpool_worker, (void *)thread);
+}
+void thread_end(Thread thread) {
+	pthread_join(thread.thread, NULL);
 }
 
 void thread_init(TPool *pool, Thread *thread, int idx) {
-	printf("creating thread %d\n", idx);
-	pthread_mutex_init(&thread->queue_lock, NULL);
+	mutex_init(&thread->queue_lock);
 	thread->queue = NULL;
 	thread->pool = pool;
 	thread->idx = idx;
@@ -119,7 +149,7 @@ TPool *tpool_init(int child_thread_count) {
 
 	for (int i = 1; i < pool->thread_count; i++) {
 		thread_init(pool, &pool->threads[i], i);
-		pthread_create(&pool->threads[i].thread, NULL, tpool_worker, (void *)&pool->threads[i]);
+		thread_start(&pool->threads[i]);
 	}
 
 	return pool;
@@ -128,7 +158,8 @@ TPool *tpool_init(int child_thread_count) {
 void tpool_destroy(TPool *pool) {
 	pool->running = false;
 	for (int i = 1; i < pool->thread_count - 1; i++) {
-		pthread_join(pool->threads[i].thread, NULL);
+		Thread *thread = &pool->threads[i];
+		thread_end(pool->threads[i]);
 	}
 	free(pool->threads);
 	free(pool);
@@ -136,11 +167,11 @@ void tpool_destroy(TPool *pool) {
 
 ssize_t little_work(void *args) {
 	size_t count = (size_t)args;
-	printf("%d -- %lu -- %zu\n", current_thread->idx, pthread_self(), count);
 
-	if (current_thread->pool->tasks_total < 20) {
+	if (current_thread->pool->tasks_total < 10000) {
+
 		TPool *pool = current_thread->pool;
-		int64_t sibling_idx = (current_thread->idx + 1) % pool->thread_count;
+		int64_t sibling_idx = (rand()) % pool->thread_count;
 		Thread *sibling_thread = &pool->threads[sibling_idx];
 
 		TPoolTask *task = malloc(sizeof(TPoolTask));
@@ -154,33 +185,48 @@ ssize_t little_work(void *args) {
 
 void tpool_wait(TPool *pool) {
 	while (pool->tasks_done < pool->tasks_total) {
-		while (current_thread->queue_len > 0) {
-			TPoolTask *task = tqueue_pop(current_thread);
+		while (current_thread->tasks_done < current_thread->tasks_total) {
+			TPoolTask *task = tqueue_pop_safe(current_thread);
 			if (!task) {
 				break;
 			}
 
 			task->do_work(task->args);
 			pool->tasks_done++;
+			current_thread->tasks_done++;
+		}
+		if (current_thread->tasks_done == current_thread->tasks_total) {
+			sched_yield();
 		}
 	}
 }
 
 int main(void) {
-	TPool *pool = tpool_init(1);
+	srand(1);
+	spall_auto_init("pool_test.spall");
+	spall_auto_thread_init(0, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
+
+	TPool *pool = tpool_init(8);
 
 	int initial_task_count = 10;
-	TPoolTask *tasks = malloc(sizeof(TPoolTask) * initial_task_count);
 
-	pthread_mutex_lock(&current_thread->queue_lock);
+	mutex_lock(&current_thread->queue_lock);
 	for (int i = 0; i < initial_task_count; i++) {
-		tasks[i].do_work = little_work;
-		tasks[i].args = (void *)(uint64_t)(i + 1);
-		tqueue_push(current_thread, &tasks[i]);
+		TPoolTask *task = malloc(sizeof(TPoolTask));
+		task->do_work = little_work;
+		task->args = (void *)(uint64_t)(i + 1);
+		tqueue_push(current_thread, task);
 	}
-	pthread_mutex_unlock(&current_thread->queue_lock);
+	mutex_unlock(&current_thread->queue_lock);
 
 	tpool_wait(pool);
-	printf("%lu, %lu\n", pool->tasks_done, pool->tasks_total);
 	tpool_destroy(pool);
+
+	spall_auto_thread_quit();
+	spall_auto_quit();
 }
+
+#define SPALL_AUTO_IMPLEMENTATION
+#define SPALL_BUFFER_PROFILING
+#define SPALL_BUFFER_PROFILING_GET_TIME() __rdtsc()
+#include "spall_auto.h"
