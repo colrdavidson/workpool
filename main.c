@@ -104,6 +104,8 @@ void *tpool_worker(void *ptr) {
 		if (!pool->running) {
 			break;
 		}
+
+		// If we've got task to process, work through them
 		while (current_thread->head > current_thread->tail) {
 			TPoolTask *task = tqueue_pop_safe(current_thread);
 			if (!task) {
@@ -113,7 +115,9 @@ void *tpool_worker(void *ptr) {
 			task->do_work(task->args);
 			pool->tasks_done++;
 		}
-		if (current_thread->head == current_thread->tail) {
+
+		// If there's still work somewhere and we don't have it, steal it
+		if ((pool->tasks_done < pool->tasks_total) && (current_thread->head == current_thread->tail)) {
 			int idx = current_thread->idx;
 			for (int i = 0; i < pool->thread_count; i++) {
 				if (pool->tasks_done == pool->tasks_total) {
@@ -130,17 +134,16 @@ void *tpool_worker(void *ptr) {
 					}
 
 					TPoolTask *task = tqueue_pop(thread);
-					if (!task) {
-						printf("err... This shouldn't happen?\n");
-						exit(1);
-					}
 					mutex_unlock(&thread->queue_lock);
+					if (!task) {
+						continue;
+					}
 
 					task->do_work(task->args);
 					pool->tasks_done++;
 				}
 			}
-
+		} else {
 			thread_sleep();
 		}
 	}
@@ -212,6 +215,7 @@ void tpool_destroy(TPool *pool) {
 		Thread *thread = &pool->threads[i];
 		thread_end(pool->threads[i]);
 	}
+	free(pool->threads[0].queue);
 	free(pool->threads);
 	free(pool);
 }
@@ -241,7 +245,7 @@ int main(void) {
 	spall_auto_init("pool_test.spall");
 	spall_auto_thread_init(0, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
-	TPool *pool = tpool_init(8);
+	TPool *pool = tpool_init(12);
 
 	int initial_task_count = 10;
 
