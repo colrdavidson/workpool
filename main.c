@@ -35,6 +35,9 @@ typedef struct TPool {
 	int thread_count;
 	bool running;
 
+	pthread_cond_t tasks_available;
+	pthread_mutex_t task_lock;
+
 	_Atomic uint64_t tasks_done;
 	_Atomic uint64_t tasks_total;
 } TPool;
@@ -54,6 +57,18 @@ void mutex_unlock(pthread_mutex_t *mut) {
 int mutex_trylock(pthread_mutex_t *mut) {
 	return pthread_mutex_trylock(mut);
 }
+void cond_init(pthread_cond_t *cond) {
+	pthread_cond_init(cond, NULL);
+}
+void cond_broadcast(pthread_cond_t *cond) {
+	pthread_cond_broadcast(cond);
+}
+void cond_signal(pthread_cond_t *cond) {
+	pthread_cond_signal(cond);
+}
+void cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
+	pthread_cond_wait(cond, mutex);
+}
 
 void tqueue_push(Thread *thread, TPoolTask task) {
 	if ((thread->head - thread->tail) >= thread->capacity) {
@@ -65,6 +80,8 @@ void tqueue_push(Thread *thread, TPoolTask task) {
 	thread->queue[idx] = task;
 	thread->head++;
 	thread->pool->tasks_total++;
+
+	cond_broadcast(&thread->pool->tasks_available);
 }
 
 void tqueue_push_safe(Thread *thread, TPoolTask task) {
@@ -101,17 +118,19 @@ void *tpool_worker(void *ptr) {
 	spall_auto_thread_init(current_thread->idx, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
 	for (;;) {
+		work_start:
+
 		if (!pool->running) {
 			break;
 		}
 
-		// If we've got task to process, work through them
+		// If we've got tasks to process, work through them
 		while (current_thread->head > current_thread->tail) {
 			TPoolTask *task = tqueue_pop_safe(current_thread);
 			if (!task) {
-				printf("err... This shouldn't happen?\n");
-				exit(1);
+				break;
 			}
+
 			task->do_work(task->args);
 			pool->tasks_done++;
 		}
@@ -141,10 +160,15 @@ void *tpool_worker(void *ptr) {
 
 					task->do_work(task->args);
 					pool->tasks_done++;
+					goto work_start;
 				}
 			}
-		} else {
-			thread_sleep();
+		}
+
+		// if we've done all our work, there's nothing to steal, but work is still outstanding, go to sleep
+		if (pool->tasks_done < pool->tasks_total) {
+			cond_wait(&pool->tasks_available, &pool->task_lock);
+			mutex_unlock(&pool->task_lock);
 		}
 	}
 
@@ -154,19 +178,23 @@ void *tpool_worker(void *ptr) {
 
 void tpool_wait(TPool *pool) {
 	while (pool->tasks_done < pool->tasks_total) {
+
+		// if we've got tasks on our queue, run them
 		while (current_thread->head > current_thread->tail) {
 			TPoolTask *task = tqueue_pop_safe(current_thread);
 			if (!task) {
-				printf("err... This shouldn't happen?\n");
-				exit(1);
+				break;
 			}
 
 			task->do_work(task->args);
 			pool->tasks_done++;
 		}
-		if (current_thread->head == current_thread->tail) {
-			thread_sleep();
+
+		if (pool->tasks_done == pool->tasks_total) {
+			break;
 		}
+
+		thread_sleep();
 	}
 }
 
@@ -195,6 +223,8 @@ TPool *tpool_init(int child_thread_count) {
 
 	pool->thread_count = thread_count;
 	pool->threads = malloc(sizeof(Thread) * pool->thread_count);
+	cond_init(&pool->tasks_available);
+	mutex_init(&pool->task_lock);
 	pool->running = true;
 
 	// setup the main thread
@@ -213,8 +243,10 @@ void tpool_destroy(TPool *pool) {
 	pool->running = false;
 	for (int i = 1; i < pool->thread_count - 1; i++) {
 		Thread *thread = &pool->threads[i];
+		cond_broadcast(&pool->tasks_available);
 		thread_end(pool->threads[i]);
 	}
+
 	free(pool->threads[0].queue);
 	free(pool->threads);
 	free(pool);
@@ -224,7 +256,8 @@ ssize_t little_work(void *args) {
 	size_t count = (size_t)args;
 
 	// this is my workload. enjoy
-	usleep(100);
+	int sleep_time = rand() % 201;
+	usleep(sleep_time);
 
 	if (current_thread->pool->tasks_total < 10000) {
 		mutex_lock(&current_thread->queue_lock);
