@@ -118,13 +118,13 @@ void *tpool_worker(void *ptr) {
 	spall_auto_thread_init(current_thread->idx, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
 	for (;;) {
-		work_start:
-
+work_start:
 		if (!pool->running) {
 			break;
 		}
 
 		// If we've got tasks to process, work through them
+		size_t finished_tasks = 0;
 		while (current_thread->head > current_thread->tail) {
 			TPoolTask *task = tqueue_pop_safe(current_thread);
 			if (!task) {
@@ -133,6 +133,10 @@ void *tpool_worker(void *ptr) {
 
 			task->do_work(task->args);
 			pool->tasks_done++;
+			finished_tasks++;
+		}
+		if (finished_tasks > 0 && pool->tasks_done == pool->tasks_total) {
+			cond_broadcast(&pool->tasks_available);
 		}
 
 		// If there's still work somewhere and we don't have it, steal it
@@ -160,18 +164,20 @@ void *tpool_worker(void *ptr) {
 
 					task->do_work(task->args);
 					pool->tasks_done++;
+
+					if (pool->tasks_done == pool->tasks_total) {
+						cond_broadcast(&pool->tasks_available);
+					}
 					goto work_start;
 				}
 			}
 		}
 
-		// if we've done all our work, there's nothing to steal, but work is still outstanding, go to sleep
-		if (pool->tasks_done < pool->tasks_total) {
-			mutex_lock(&pool->task_lock);
-			int ret = cond_wait(&pool->tasks_available, &pool->task_lock);
-			if (!ret) {
-				mutex_unlock(&pool->task_lock);
-			}
+		// if we've done all our work, and there's nothing to steal, go to sleep
+		mutex_lock(&pool->task_lock);
+		int ret = cond_wait(&pool->tasks_available, &pool->task_lock);
+		if (!ret) {
+			mutex_unlock(&pool->task_lock);
 		}
 	}
 
@@ -197,7 +203,11 @@ void tpool_wait(TPool *pool) {
 			break;
 		}
 
-		thread_sleep();
+		mutex_lock(&pool->task_lock);
+		int ret = cond_wait(&pool->tasks_available, &pool->task_lock);
+		if (!ret) {
+			mutex_unlock(&pool->task_lock);
+		}
 	}
 }
 
@@ -287,6 +297,23 @@ int main(void) {
 
 	mutex_lock(&current_thread->queue_lock);
 	for (int i = 0; i < initial_task_count; i++) {
+		TPoolTask task;
+		task.do_work = little_work;
+		task.args = (void *)(uint64_t)(i + 1);
+		tqueue_push(current_thread, task);
+	}
+	mutex_unlock(&current_thread->queue_lock);
+
+	tpool_wait(pool);
+	usleep(500);
+
+	// this is a dumb hack because of the way I do task growth.
+	// not required to make this pool work
+	pool->tasks_total = 0;
+	pool->tasks_done  = 0;
+
+	mutex_lock(&current_thread->queue_lock);
+	for (int i = initial_task_count; i < (initial_task_count * 2); i++) {
 		TPoolTask task;
 		task.do_work = little_work;
 		task.args = (void *)(uint64_t)(i + 1);
