@@ -33,7 +33,7 @@ typedef struct TPool {
 	struct Thread *threads;
 
 	int thread_count;
-	bool running;
+	_Atomic bool running;
 
 	pthread_cond_t tasks_available;
 	pthread_mutex_t task_lock;
@@ -66,8 +66,8 @@ void cond_broadcast(pthread_cond_t *cond) {
 void cond_signal(pthread_cond_t *cond) {
 	pthread_cond_signal(cond);
 }
-void cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
-	pthread_cond_wait(cond, mutex);
+int cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
+	return pthread_cond_wait(cond, mutex);
 }
 
 void tqueue_push(Thread *thread, TPoolTask task) {
@@ -167,8 +167,11 @@ void *tpool_worker(void *ptr) {
 
 		// if we've done all our work, there's nothing to steal, but work is still outstanding, go to sleep
 		if (pool->tasks_done < pool->tasks_total) {
-			cond_wait(&pool->tasks_available, &pool->task_lock);
-			mutex_unlock(&pool->task_lock);
+			mutex_lock(&pool->task_lock);
+			int ret = cond_wait(&pool->tasks_available, &pool->task_lock);
+			if (!ret) {
+				mutex_unlock(&pool->task_lock);
+			}
 		}
 	}
 
@@ -241,7 +244,7 @@ TPool *tpool_init(int child_thread_count) {
 
 void tpool_destroy(TPool *pool) {
 	pool->running = false;
-	for (int i = 1; i < pool->thread_count - 1; i++) {
+	for (int i = 1; i < pool->thread_count; i++) {
 		Thread *thread = &pool->threads[i];
 		cond_broadcast(&pool->tasks_available);
 		thread_end(pool->threads[i]);
