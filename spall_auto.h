@@ -341,6 +341,10 @@ int load_self(AddrHash *ah) {
 #include <sys/types.h>
 #include <sys/sysctl.h>
 
+int load_self(AddrHash *ah) {
+	return 1;
+}
+
 SPALL_FN double get_rdtsc_multiplier() {
 	uint64_t freq;
 	size_t size = sizeof(freq);
