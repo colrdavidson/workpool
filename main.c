@@ -7,9 +7,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
-
-#define THREAD_QUEUE_CAP 16000
 typedef ssize_t tpool_task_proc(void *data);
 typedef struct TPoolTask {
 	tpool_task_proc  *do_work;
@@ -22,9 +21,7 @@ typedef struct Thread {
 
 	TPoolTask *queue;
 	size_t capacity;
-	_Atomic uint64_t head;
-	_Atomic uint64_t tail;
-	pthread_mutex_t queue_lock;
+	_Atomic uint64_t head_and_tail;
 
 	struct TPool *pool;
 } Thread;
@@ -38,8 +35,7 @@ typedef struct TPool {
 	pthread_cond_t tasks_available;
 	pthread_mutex_t task_lock;
 
-	_Atomic uint64_t tasks_done;
-	_Atomic uint64_t tasks_total;
+	_Atomic int32_t tasks_left;
 } TPool;
 
 _Thread_local Thread *current_thread = NULL;
@@ -71,48 +67,62 @@ int cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
 }
 
 void tqueue_push(Thread *thread, TPoolTask task) {
-	if ((thread->head - thread->tail) >= thread->capacity) {
-		printf("Task queue is too full!!\n");
-		exit(1);
-	}
+	uint64_t capture;
+	uint64_t new_capture;
+	do {
+		capture = thread->head_and_tail;
 
-	size_t idx = thread->head % thread->capacity;
-	thread->queue[idx] = task;
-	thread->head++;
-	thread->pool->tasks_total++;
+		uint64_t mask = thread->capacity - 1;
+		uint64_t head = (capture >> 32) & mask;
+		uint64_t tail = ((uint32_t)capture) & mask;
 
+		uint64_t new_head = (head + 1) & mask;
+		if (new_head == tail) {
+			printf("queue full? %lx %lx %lx, %lx\n", head, new_head, tail, capture);
+			exit(1);
+		}
+
+		// This *must* be done in here, to avoid a potential race condition where we no longer own the slot by the time we're assigning
+		thread->queue[head] = task;
+		new_capture = (new_head << 32) | tail;
+	} while (!atomic_compare_exchange_weak(&thread->head_and_tail, &capture, new_capture));
+
+	thread->pool->tasks_left++;
 	cond_broadcast(&thread->pool->tasks_available);
 }
 
-void tqueue_push_safe(Thread *thread, TPoolTask task) {
-	mutex_lock(&thread->queue_lock);
-	tqueue_push(thread, task);
-	mutex_unlock(&thread->queue_lock);
+bool tqueue_pop(Thread *thread, TPoolTask *task) {
+	uint64_t capture;
+	uint64_t new_capture;
+	do {
+		capture = thread->head_and_tail;
+
+		uint64_t mask = thread->capacity - 1;
+		uint64_t head = (capture >> 32) & mask;
+		uint64_t tail = ((uint32_t)capture) & mask;
+
+		uint64_t new_tail = (tail + 1) & mask;
+		if (tail == head) {
+			return false;
+		}
+
+		// Making a copy of the task before we increment the tail, avoiding the same potential race condition as above
+		*task = thread->queue[tail];
+
+		new_capture = (head << 32) | new_tail;
+	} while (!atomic_compare_exchange_weak(&thread->head_and_tail, &capture, new_capture));
+
+	return true;
 }
 
-TPoolTask *tqueue_pop(Thread *thread) {
-	if (thread->tail >= thread->head) {
-		return NULL;
-	}
-
-	size_t idx = thread->tail % thread->capacity;
-	TPoolTask *task = &thread->queue[idx];
-	thread->tail++;
-	return task;
+/*
+void sleep_until_work(TPool *pool) {
+	syscall(SYS_FUTEX, &pool->tasks_left, FUTEX_WAKE, 
 }
-
-TPoolTask *tqueue_pop_safe(Thread *thread) {
-	mutex_lock(&thread->queue_lock);
-	TPoolTask *task = tqueue_pop(thread);
-	mutex_unlock(&thread->queue_lock);
-	return task;
-}
-
-void thread_sleep(void) {
-	sched_yield();
-}
+*/
 
 void *tpool_worker(void *ptr) {
+	TPoolTask task;
 	current_thread = (Thread *)ptr;
 	TPool *pool = current_thread->pool;
 	spall_auto_thread_init(current_thread->idx, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
@@ -125,51 +135,39 @@ work_start:
 
 		// If we've got tasks to process, work through them
 		size_t finished_tasks = 0;
-		while (current_thread->head > current_thread->tail) {
-			TPoolTask *task = tqueue_pop_safe(current_thread);
-			if (!task) {
-				break;
-			}
-
-			task->do_work(task->args);
-			pool->tasks_done++;
-			finished_tasks++;
+		while (tqueue_pop(current_thread, &task)) {
+			task.do_work(task.args);
+			pool->tasks_left--;
+			finished_tasks += 1;
 		}
-		if (finished_tasks > 0 && pool->tasks_done == pool->tasks_total) {
+		if (finished_tasks > 0 && !pool->tasks_left) {
 			cond_broadcast(&pool->tasks_available);
 		}
 
 		// If there's still work somewhere and we don't have it, steal it
-		if ((pool->tasks_done < pool->tasks_total) && (current_thread->head == current_thread->tail)) {
+		if (pool->tasks_left) {
 			int idx = current_thread->idx;
 			for (int i = 0; i < pool->thread_count; i++) {
-				if (pool->tasks_done == pool->tasks_total) {
+				if (!pool->tasks_left) {
 					break;
 				}
 
 				idx = (idx + 1) % pool->thread_count;
 				Thread *thread = &pool->threads[idx];
 
-				if (thread->head > thread->tail) {
-					int ret = mutex_trylock(&thread->queue_lock);
-					if (ret) {
-						continue;
-					}
-
-					TPoolTask *task = tqueue_pop(thread);
-					mutex_unlock(&thread->queue_lock);
-					if (!task) {
-						continue;
-					}
-
-					task->do_work(task->args);
-					pool->tasks_done++;
-
-					if (pool->tasks_done == pool->tasks_total) {
-						cond_broadcast(&pool->tasks_available);
-					}
-					goto work_start;
+				TPoolTask task;
+				if (!tqueue_pop(thread, &task)) {
+					continue;
 				}
+
+				task.do_work(task.args);
+				pool->tasks_left--;
+
+				if (!pool->tasks_left) {
+					cond_broadcast(&pool->tasks_available);
+				}
+
+				goto work_start;
 			}
 		}
 
@@ -186,23 +184,21 @@ work_start:
 }
 
 void tpool_wait(TPool *pool) {
-	while (pool->tasks_done < pool->tasks_total) {
+	TPoolTask task;
+
+	while (pool->tasks_left) {
 
 		// if we've got tasks on our queue, run them
-		while (current_thread->head > current_thread->tail) {
-			TPoolTask *task = tqueue_pop_safe(current_thread);
-			if (!task) {
-				break;
-			}
-
-			task->do_work(task->args);
-			pool->tasks_done++;
+		while (tqueue_pop(current_thread, &task)) {
+			task.do_work(task.args);
+			pool->tasks_left--;
 		}
 
-		if (pool->tasks_done == pool->tasks_total) {
+		if (!pool->tasks_left) {
 			break;
 		}
 
+		// if we've done all our work, and there's nothing to steal, go to sleep
 		mutex_lock(&pool->task_lock);
 		int ret = cond_wait(&pool->tasks_available, &pool->task_lock);
 		if (!ret) {
@@ -220,11 +216,10 @@ void thread_end(Thread thread) {
 }
 
 void thread_init(TPool *pool, Thread *thread, int idx) {
-	mutex_init(&thread->queue_lock);
-	thread->capacity = THREAD_QUEUE_CAP;
+	thread->capacity = 1 << 14; // must be a power of 2
+
 	thread->queue = calloc(sizeof(TPoolTask), thread->capacity);
-	thread->head = 0;
-	thread->tail = 0;
+	thread->head_and_tail = 0;
 	thread->pool = pool;
 	thread->idx = idx;
 }
@@ -265,23 +260,23 @@ void tpool_destroy(TPool *pool) {
 	free(pool);
 }
 
+_Atomic static int total_tasks = 0;
 ssize_t little_work(void *args) {
-	size_t count = (size_t)args;
 
 	// this is my workload. enjoy
-	int sleep_time = rand() % 201;
+	int sleep_time = rand() % 301;
 	usleep(sleep_time);
 
-	if (current_thread->pool->tasks_total < 10000) {
-		mutex_lock(&current_thread->queue_lock);
+	if (total_tasks < 2000) {
 		for (int i = 0; i < 5; i++) {
 			TPoolTask task;
 			task.do_work = little_work;
-			task.args = (void *)(uint64_t)(count);
+			task.args = NULL;
 			tqueue_push(current_thread, task);
 		}
-		mutex_unlock(&current_thread->queue_lock);
 	}
+
+	total_tasks++;
 	return 0;
 }
 
@@ -295,31 +290,22 @@ int main(void) {
 
 	int initial_task_count = 10;
 
-	mutex_lock(&current_thread->queue_lock);
 	for (int i = 0; i < initial_task_count; i++) {
 		TPoolTask task;
 		task.do_work = little_work;
-		task.args = (void *)(uint64_t)(i + 1);
+		task.args = NULL;
 		tqueue_push(current_thread, task);
 	}
-	mutex_unlock(&current_thread->queue_lock);
 
 	tpool_wait(pool);
-	usleep(500);
 
-	// this is a dumb hack because of the way I do task growth.
-	// not required to make this pool work
-	pool->tasks_total = 0;
-	pool->tasks_done  = 0;
-
-	mutex_lock(&current_thread->queue_lock);
-	for (int i = initial_task_count; i < (initial_task_count * 2); i++) {
+	total_tasks = 0;
+	for (int i = 0; i < initial_task_count; i++) {
 		TPoolTask task;
 		task.do_work = little_work;
-		task.args = (void *)(uint64_t)(i + 1);
+		task.args = NULL;
 		tqueue_push(current_thread, task);
 	}
-	mutex_unlock(&current_thread->queue_lock);
 
 	tpool_wait(pool);
 	tpool_destroy(pool);
