@@ -92,7 +92,6 @@ void tqueue_push(Thread *thread, TPoolTask task) {
 	} while (!atomic_compare_exchange_weak(&thread->head_and_tail, &capture, new_capture));
 
 	thread->pool->tasks_left++;
-
 	cond_broadcast(&thread->pool->tasks_available);
 }
 
@@ -221,11 +220,14 @@ void tpool_wait(TPool *pool) {
 		// if we've got tasks on our queue, run them
 		while (tqueue_pop(current_thread, &task)) {
 			task.do_work(task.args);
-
 			pool->tasks_left--;
 		}
 
+
 		// is this mem-barriered enough?
+		// This *must* be executed in this order, so the futex wakes immediately
+		// if rem_tasks has changed since we checked last, otherwise the program
+		// will permanently sleep
 		_Atomic int32_t rem_tasks = pool->tasks_left;
 		if (!rem_tasks) {
 			break;
