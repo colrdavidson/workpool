@@ -9,6 +9,10 @@
 #include <unistd.h>
 #include <stdatomic.h>
 
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <errno.h>
+
 typedef ssize_t tpool_task_proc(void *data);
 typedef struct TPoolTask {
 	tpool_task_proc  *do_work;
@@ -78,7 +82,7 @@ void tqueue_push(Thread *thread, TPoolTask task) {
 
 		uint64_t new_head = (head + 1) & mask;
 		if (new_head == tail) {
-			printf("queue full? %lx %lx %lx, %lx\n", head, new_head, tail, capture);
+			printf("queue full? %lx %lx %lx, %lx, capacity: %lx\n", head, new_head, tail, capture, thread->capacity);
 			exit(1);
 		}
 
@@ -88,6 +92,7 @@ void tqueue_push(Thread *thread, TPoolTask task) {
 	} while (!atomic_compare_exchange_weak(&thread->head_and_tail, &capture, new_capture));
 
 	thread->pool->tasks_left++;
+
 	cond_broadcast(&thread->pool->tasks_available);
 }
 
@@ -115,11 +120,35 @@ bool tqueue_pop(Thread *thread, TPoolTask *task) {
 	return true;
 }
 
-/*
-void sleep_until_work(TPool *pool) {
-	syscall(SYS_FUTEX, &pool->tasks_left, FUTEX_WAKE, 
+void tpool_wake_addr(_Atomic int32_t *addr) {
+	for (;;) {
+		int ret = syscall(SYS_futex, addr, FUTEX_WAKE, 1, NULL, NULL, 0);
+		if (ret == -1) {
+			perror("Futex wake");
+			exit(1);
+		} else if (ret > 0) {
+			return;
+		}
+	}
 }
-*/
+
+void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
+	for (;;) {
+		int ret = syscall(SYS_futex, addr, FUTEX_WAIT, val, NULL, NULL, 0);
+		if (ret == -1) {
+			if (errno != EAGAIN) {
+				perror("Futex wait");
+				exit(1);
+			} else {
+				return;
+			}
+		} else if (ret == 0) {
+			if (*addr != val) {
+				return;
+			}
+		}
+	}
+}
 
 void *tpool_worker(void *ptr) {
 	TPoolTask task;
@@ -138,10 +167,11 @@ work_start:
 		while (tqueue_pop(current_thread, &task)) {
 			task.do_work(task.args);
 			pool->tasks_left--;
+
 			finished_tasks += 1;
 		}
 		if (finished_tasks > 0 && !pool->tasks_left) {
-			cond_broadcast(&pool->tasks_available);
+			tpool_wake_addr(&pool->tasks_left);
 		}
 
 		// If there's still work somewhere and we don't have it, steal it
@@ -164,7 +194,7 @@ work_start:
 				pool->tasks_left--;
 
 				if (!pool->tasks_left) {
-					cond_broadcast(&pool->tasks_available);
+					tpool_wake_addr(&pool->tasks_left);
 				}
 
 				goto work_start;
@@ -191,19 +221,17 @@ void tpool_wait(TPool *pool) {
 		// if we've got tasks on our queue, run them
 		while (tqueue_pop(current_thread, &task)) {
 			task.do_work(task.args);
+
 			pool->tasks_left--;
 		}
 
-		if (!pool->tasks_left) {
+		// is this mem-barriered enough?
+		_Atomic int32_t rem_tasks = pool->tasks_left;
+		if (!rem_tasks) {
 			break;
 		}
 
-		// if we've done all our work, and there's nothing to steal, go to sleep
-		mutex_lock(&pool->task_lock);
-		int ret = cond_wait(&pool->tasks_available, &pool->task_lock);
-		if (!ret) {
-			mutex_unlock(&pool->task_lock);
-		}
+		tpool_wait_on_addr(&pool->tasks_left, rem_tasks);
 	}
 }
 
@@ -264,7 +292,7 @@ _Atomic static int total_tasks = 0;
 ssize_t little_work(void *args) {
 
 	// this is my workload. enjoy
-	int sleep_time = rand() % 301;
+	int sleep_time = rand() % 201;
 	usleep(sleep_time);
 
 	if (total_tasks < 2000) {
@@ -307,6 +335,15 @@ int main(void) {
 		tqueue_push(current_thread, task);
 	}
 
+	tpool_wait(pool);
+
+	total_tasks = 0;
+	for (int i = 0; i < initial_task_count; i++) {
+		TPoolTask task;
+		task.do_work = little_work;
+		task.args = NULL;
+		tqueue_push(current_thread, task);
+	}
 	tpool_wait(pool);
 	tpool_destroy(pool);
 
