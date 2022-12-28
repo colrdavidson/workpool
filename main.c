@@ -35,10 +35,13 @@ typedef pthread_cond_t CondVar;
 #include <linux/futex.h>
 #include <sys/syscall.h>
 
+typedef int32_t Futex;
+
 #elif defined(__APPLE__)
 
 #include <sys/syscall.h>
 
+typedef int64_t Futex;
 #elif defined(_WIN32)
 
 #include <windows.h>
@@ -61,6 +64,7 @@ typedef CONDITION_VARIABLE CondVar;
 #define cond_signal(cond) WakeConditionVariable(cond)
 #define cond_wait(cond, mutex) SleepConditionVariableCS(cond, mutex, INFINITE)
 
+typedef int64_t Futex;
 #endif
 
 typedef void tpool_task_proc(void *data);
@@ -90,14 +94,14 @@ typedef struct TPool {
 	CondVar tasks_available;
 	Mutex task_lock;
 
-	_Atomic int32_t tasks_left;
+	Futex tasks_left;
 } TPool;
 
 _Thread_local Thread *current_thread = NULL;
 _Thread_local int work_count = 0;
 
 #if defined(__linux__)
-void tpool_wake_addr(_Atomic int32_t *addr) {
+void tpool_wake_addr(Futex *addr) {
 	for (;;) {
 		int ret = syscall(SYS_futex, addr, FUTEX_WAKE, 1, NULL, NULL, 0);
 		if (ret == -1) {
@@ -109,7 +113,7 @@ void tpool_wake_addr(_Atomic int32_t *addr) {
 	}
 }
 
-void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
+void tpool_wait_on_addr(Futex *addr, Futex val) {
 	for (;;) {
 		int ret = syscall(SYS_futex, addr, FUTEX_WAIT, val, NULL, NULL, 0);
 		if (ret == -1) {
@@ -134,7 +138,7 @@ void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
 int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout); /* timeout is specified in microseconds */
 int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
 
-void tpool_wake_addr(_Atomic int32_t *addr) {
+void tpool_wake_addr(Futex *addr) {
 	for (;;) {
 		int ret = __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, addr, 0);
 		if (ret >= 0) {
@@ -151,7 +155,7 @@ void tpool_wake_addr(_Atomic int32_t *addr) {
 	}
 }
 
-void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
+void tpool_wait_on_addr(Futex *addr, Futex val) {
 	for (;;) {
 		int ret = __ulock_wait(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, addr, val, 0);
 		if (ret >= 0) {
@@ -172,11 +176,11 @@ void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
 	}
 }
 #elif defined(_WIN32)
-void tpool_wake_addr(_Atomic int32_t *addr) {
+void tpool_wake_addr(Futex *addr) {
 	WakeByAddressSingle(addr);
 }
 
-void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
+void tpool_wait_on_addr(Futex *addr, Futex val) {
 	for (;;) {
 		int ret = WaitOnAddress(addr, &val, sizeof(val), INFINITE);
 		if (*addr != val) break;
@@ -319,7 +323,7 @@ void tpool_wait(TPool *pool) {
 		// This *must* be executed in this order, so the futex wakes immediately
 		// if rem_tasks has changed since we checked last, otherwise the program
 		// will permanently sleep
-		_Atomic int32_t rem_tasks = pool->tasks_left;
+		Futex rem_tasks = pool->tasks_left;
 		if (!rem_tasks) {
 			break;
 		}
