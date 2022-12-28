@@ -22,7 +22,7 @@ typedef pthread_cond_t CondVar;
 #define mutex_unlock(mut) pthread_mutex_unlock(mut)
 
 #define thread_start(t) pthread_create(&(t)->thread, NULL, tpool_worker, (void *) (t))
-#define thread_end(t)   (pthread_join((t)->thread, NULL), free((t)->queue))
+#define thread_end(t)   pthread_join((t)->thread, NULL)
 
 #define cond_init(cond) pthread_cond_init(cond, NULL)
 #define cond_broadcast(cond) pthread_cond_broadcast(cond)
@@ -94,7 +94,6 @@ void tqueue_push(Thread *thread, TPoolTask task) {
 
 		uint64_t new_head = (head + 1) & mask;
 		if (new_head == tail) {
-			printf("queue full? %lx %lx %lx, %lx, capacity: %lx\n", head, new_head, tail, capture, thread->capacity);
 			exit(1);
 		}
 
@@ -283,12 +282,12 @@ void thread_init(TPool *pool, Thread *thread, int idx) {
 }
 
 TPool *tpool_init(int child_thread_count) {
-	TPool *pool = malloc(sizeof(TPool));
+	TPool *pool = calloc(sizeof(TPool), 1);
 
 	int thread_count = child_thread_count + 1;
-
 	pool->thread_count = thread_count;
 	pool->threads = malloc(sizeof(Thread) * pool->thread_count);
+
 	cond_init(&pool->tasks_available);
 	mutex_init(&pool->task_lock);
 	pool->running = true;
@@ -312,8 +311,10 @@ void tpool_destroy(TPool *pool) {
 		cond_broadcast(&pool->tasks_available);
 		thread_end(&pool->threads[i]);
 	}
+	for (int i = 0; i < pool->thread_count; i++) {
+		free(pool->threads[i].queue);
+	}
 
-	free(pool->threads[0].queue);
 	free(pool->threads);
 	free(pool);
 }
@@ -322,9 +323,9 @@ static float aaa[10000];
 
 _Atomic static int total_tasks = 0;
 void little_work(void *args) {
+	// this is my workload. enjoy
 	int sleep_time = rand() % 201;
 	#ifndef _WIN32
-	// this is my workload. enjoy
 	usleep(sleep_time);
 	#else
 	for (size_t i = 0; i < 10000; i++) {
@@ -350,7 +351,7 @@ int main(void) {
 	spall_auto_init("pool_test.spall");
 	spall_auto_thread_init(0, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
-	TPool *pool = tpool_init(5);
+	TPool *pool = tpool_init(32);
 
 	int initial_task_count = 10;
 
