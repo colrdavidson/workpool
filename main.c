@@ -63,6 +63,7 @@ typedef pthread_cond_t CondVar;
 #define ATOMIC_DEC32(val) ((val)--)
 #define ATOMIC_DEC64(val) ((val)--)
 #define ATOMIC_FUTEX_DEC(val) ((val)--)
+#define __debugbreak() __builtin_trap()
 #endif
 
 #if defined(__linux__)
