@@ -4,23 +4,60 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <pthread.h>
-#include <sched.h>
-#include <unistd.h>
 #include <stdatomic.h>
 
+#ifndef _WIN32
+#include <pthread.h>
+#include <unistd.h>
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <errno.h>
 
-typedef ssize_t tpool_task_proc(void *data);
+typedef pthread_mutex_t Mutex;
+typedef pthread_t ThreadHandle;
+typedef pthread_cond_t CondVar;
+
+#define mutex_init(mut) pthread_mutex_init(mut)
+#define mutex_lock(mut) pthread_mutex_lock(mut)
+#define mutex_unlock(mut) pthread_mutex_unlock(mut)
+
+#define thread_start(t) pthread_create(&(t)->thread, NULL, tpool_worker, (void *) (t))
+#define thread_end(t)   (pthread_join((t)->thread, NULL), free((t)->queue))
+
+#define cond_init(cond) pthread_cond_init(cond, NULL)
+#define cond_broadcast(cond) pthread_cond_broadcast(cond)
+#define cond_signal(cond) pthread_cond_signal(cond)
+#define cond_wait(cond, mutex) pthread_cond_wait(cond, mutex)
+#else
+#include <windows.h>
+#include <process.h>
+
+typedef ptrdiff_t ssize_t;
+typedef CRITICAL_SECTION Mutex;
+typedef HANDLE ThreadHandle;
+typedef CONDITION_VARIABLE CondVar;
+
+#define mutex_init(mut) InitializeCriticalSection(mut)
+#define mutex_lock(mut) EnterCriticalSection(mut)
+#define mutex_unlock(mut) LeaveCriticalSection(mut)
+
+#define thread_start(t) ((t)->thread = (HANDLE) _beginthread(tpool_worker, 0, t))
+
+#define cond_init(cond) InitializeConditionVariable(cond)
+#define cond_broadcast(cond) WakeAllConditionVariable(cond)
+#define cond_signal(cond) WakeConditionVariable(cond)
+#define cond_wait(cond, mutex) SleepConditionVariableCS(cond, mutex, INFINITE)
+#endif
+
+typedef void tpool_task_proc(void *data);
+
 typedef struct TPoolTask {
 	tpool_task_proc  *do_work;
 	void             *args;
 } TPoolTask;
 
 typedef struct Thread {
-	pthread_t thread;
+	ThreadHandle thread;
 	int idx;
 
 	TPoolTask *queue;
@@ -36,39 +73,14 @@ typedef struct TPool {
 	int thread_count;
 	_Atomic bool running;
 
-	pthread_cond_t tasks_available;
-	pthread_mutex_t task_lock;
+	CondVar tasks_available;
+	Mutex task_lock;
 
 	_Atomic int32_t tasks_left;
 } TPool;
 
 _Thread_local Thread *current_thread = NULL;
 _Thread_local int work_count = 0;
-
-void mutex_init(pthread_mutex_t *mut) {
-	pthread_mutex_init(mut, NULL);
-}
-void mutex_lock(pthread_mutex_t *mut) {
-	pthread_mutex_lock(mut);
-}
-void mutex_unlock(pthread_mutex_t *mut) {
-	pthread_mutex_unlock(mut);
-}
-int mutex_trylock(pthread_mutex_t *mut) {
-	return pthread_mutex_trylock(mut);
-}
-void cond_init(pthread_cond_t *cond) {
-	pthread_cond_init(cond, NULL);
-}
-void cond_broadcast(pthread_cond_t *cond) {
-	pthread_cond_broadcast(cond);
-}
-void cond_signal(pthread_cond_t *cond) {
-	pthread_cond_signal(cond);
-}
-int cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
-	return pthread_cond_wait(cond, mutex);
-}
 
 void tqueue_push(Thread *thread, TPoolTask task) {
 	uint64_t capture;
@@ -119,6 +131,7 @@ bool tqueue_pop(Thread *thread, TPoolTask *task) {
 	return true;
 }
 
+#ifndef _WIN32
 void tpool_wake_addr(_Atomic int32_t *addr) {
 	for (;;) {
 		int ret = syscall(SYS_futex, addr, FUTEX_WAKE, 1, NULL, NULL, 0);
@@ -148,15 +161,36 @@ void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
 		}
 	}
 }
+#else
+void tpool_wake_addr(_Atomic int32_t *addr) {
+	WakeByAddressSingle(addr);
+}
 
-void *tpool_worker(void *ptr) {
+void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
+	for (;;) {
+		int ret = WaitOnAddress(addr, &val, sizeof(val), INFINITE);
+		if (*addr != val) break;
+	}
+}
+
+void thread_end(Thread *t) {
+	WaitForSingleObject(t->thread, INFINITE);
+}
+#endif
+
+#ifndef _WIN32
+void *tpool_worker(void *ptr)
+#else
+void tpool_worker(void *ptr)
+#endif
+{
 	TPoolTask task;
 	current_thread = (Thread *)ptr;
 	TPool *pool = current_thread->pool;
 	spall_auto_thread_init(current_thread->idx, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
 	for (;;) {
-work_start:
+        work_start:
 		if (!pool->running) {
 			break;
 		}
@@ -203,13 +237,15 @@ work_start:
 		// if we've done all our work, and there's nothing to steal, go to sleep
 		mutex_lock(&pool->task_lock);
 		int ret = cond_wait(&pool->tasks_available, &pool->task_lock);
-		if (!ret) {
-			mutex_unlock(&pool->task_lock);
-		}
+		// if (!ret) {
+		mutex_unlock(&pool->task_lock);
+		// }
 	}
 
 	spall_auto_thread_quit();
+#ifndef _WIN32
 	return NULL;
+#endif
 }
 
 void tpool_wait(TPool *pool) {
@@ -235,14 +271,6 @@ void tpool_wait(TPool *pool) {
 
 		tpool_wait_on_addr(&pool->tasks_left, rem_tasks);
 	}
-}
-
-void thread_start(Thread *thread) {
-	pthread_create(&thread->thread, NULL, tpool_worker, (void *)thread);
-}
-void thread_end(Thread thread) {
-	pthread_join(thread.thread, NULL);
-	free(thread.queue);
 }
 
 void thread_init(TPool *pool, Thread *thread, int idx) {
@@ -282,7 +310,7 @@ void tpool_destroy(TPool *pool) {
 	for (int i = 1; i < pool->thread_count; i++) {
 		Thread *thread = &pool->threads[i];
 		cond_broadcast(&pool->tasks_available);
-		thread_end(pool->threads[i]);
+		thread_end(&pool->threads[i]);
 	}
 
 	free(pool->threads[0].queue);
@@ -290,12 +318,19 @@ void tpool_destroy(TPool *pool) {
 	free(pool);
 }
 
-_Atomic static int total_tasks = 0;
-ssize_t little_work(void *args) {
+static float aaa[10000];
 
-	// this is my workload. enjoy
+_Atomic static int total_tasks = 0;
+void little_work(void *args) {
 	int sleep_time = rand() % 201;
+	#ifndef _WIN32
+	// this is my workload. enjoy
 	usleep(sleep_time);
+	#else
+	for (size_t i = 0; i < 10000; i++) {
+		aaa[i] = (rand() % 2000) * 0.25;
+	}
+	#endif
 
 	if (total_tasks < 2000) {
 		for (int i = 0; i < 5; i++) {
@@ -307,7 +342,6 @@ ssize_t little_work(void *args) {
 	}
 
 	total_tasks++;
-	return 0;
 }
 
 
@@ -316,7 +350,7 @@ int main(void) {
 	spall_auto_init("pool_test.spall");
 	spall_auto_thread_init(0, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
-	TPool *pool = tpool_init(12);
+	TPool *pool = tpool_init(5);
 
 	int initial_task_count = 10;
 
