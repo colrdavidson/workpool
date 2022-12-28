@@ -166,10 +166,8 @@ SPALL_FN bool get_addr_name(void *addr, Name *name_ret) {
         WaitOnAddress(&sym_lock, &locked, sizeof(locked), INFINITE);
     }
     {
-        //char temp_data[512];
-        //SpallBuffer temp = { temp_data, sizeof(temp_data) };
-        //spall_buffer_init(&spall_ctx, &temp);
-        //double start = (double)__rdtsc();
+        spall_buffer_flush(&spall_ctx, &spall_buffer);
+        spall_buffer_begin_args(&spall_ctx, &spall_buffer, "Symbol Resolve", sizeof("Symbol Resolve") - 1, symbol.si.Name, symbol.si.NameLen, (double)__rdtsc(), tid, 0);
         if (SymFromAddr(process, (DWORD64)addr, NULL, &symbol.si)) {
             char *str = symbol.si.Name;
             size_t len = symbol.si.NameLen;
@@ -179,9 +177,7 @@ SPALL_FN bool get_addr_name(void *addr, Name *name_ret) {
             *name_ret = name;
             result = true;
         }
-        //spall_buffer_begin_args(&spall_ctx, &temp, "Symbol Resolve", sizeof("Symbol Resolve") - 1, symbol.si.Name, symbol.si.NameLen, start, tid, 0);
-        //spall_buffer_end_ex(&spall_ctx, &temp, (double)__rdtsc(), tid, 0);
-        //spall_buffer_quit(&spall_ctx, &temp);
+        spall_buffer_end_ex(&spall_ctx, &spall_buffer, (double)__rdtsc(), tid, 0);
     }
     InterlockedExchange(&sym_lock, 0);
     WakeByAddressSingle(&sym_lock);
