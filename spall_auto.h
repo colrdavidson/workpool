@@ -342,7 +342,7 @@ int load_self(AddrHash *ah) {
 
     #define round_size(addr, size) (((addr) + (size)) - ((addr) % (size)))
     uint64_t aligned_length = round_size(length, 0x1000);
-    uint8_t *self = mmap(NULL, aligned_length, PROT_READ, MAP_FILE | MAP_SHARED, fd, 0);
+    uint8_t *self = (uint8_t *)mmap(NULL, aligned_length, PROT_READ, MAP_FILE | MAP_SHARED, fd, 0);
     close(fd);
 
     ELF64_Header *elf_hdr = (ELF64_Header *)self;
@@ -389,6 +389,26 @@ int load_self(AddrHash *ah) {
         Name name;
         name.str = name_str;
         name.len = strlen(name_str);
+
+        // if we're dealing with C++ BS, demangle symbols poorly
+        if (name.len > 3 && name.str[0] == '_' && name.str[1] == 'Z' && name.str[2] == 'L') {
+            uint64_t name_len = 0;
+            int j = 3;
+            for (; j < name.len; j++) {
+                char ch = name.str[j];
+                if (ch == '\0') {
+                    break;
+                }
+
+                if (ch < '0' || ch > '9' || name_len > ((uint32_t)-1)) {
+                    break;
+                }
+
+                name_len = (name_len * 10) + (uint32_t)(ch & 0xf);
+            }
+            name.str = name.str + j;
+            name.len = SPALL_MIN(name_len, 255);
+        }
         ah_insert(ah, (void *)sym->value, name);
     }
 
@@ -561,7 +581,7 @@ SPALL_NOINSTRUMENT void __cyg_profile_func_enter(void *fn, void *caller) {
         !ah_get(&global_addr_map, fn, &name) &&
 #endif
         !ah_get(&addr_map, fn, &name)) {
-        name = (Name){.str = not_found, .len = sizeof(not_found) - 1};
+        name = (Name){.str = (char *)not_found, .len = sizeof(not_found) - 1};
     }
 
     // printf("Begin: \"%s\"\n", name.str);
