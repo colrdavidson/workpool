@@ -6,18 +6,17 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 
-#ifndef _WIN32
+#if defined(__linux__) || defined(__APPLE__)
+
 #include <pthread.h>
 #include <unistd.h>
-#include <linux/futex.h>
-#include <sys/syscall.h>
 #include <errno.h>
 
 typedef pthread_mutex_t Mutex;
 typedef pthread_t ThreadHandle;
 typedef pthread_cond_t CondVar;
 
-#define mutex_init(mut) pthread_mutex_init(mut)
+#define mutex_init(mut) pthread_mutex_init(mut, NULL)
 #define mutex_lock(mut) pthread_mutex_lock(mut)
 #define mutex_unlock(mut) pthread_mutex_unlock(mut)
 
@@ -28,7 +27,20 @@ typedef pthread_cond_t CondVar;
 #define cond_broadcast(cond) pthread_cond_broadcast(cond)
 #define cond_signal(cond) pthread_cond_signal(cond)
 #define cond_wait(cond, mutex) pthread_cond_wait(cond, mutex)
-#else
+
+#endif
+
+#if defined(__linux__)
+
+#include <linux/futex.h>
+#include <sys/syscall.h>
+
+#elif defined(__APPLE__)
+
+#include <sys/syscall.h>
+
+#elif defined(_WIN32)
+
 #include <windows.h>
 #include <process.h>
 
@@ -42,11 +54,13 @@ typedef CONDITION_VARIABLE CondVar;
 #define mutex_unlock(mut) LeaveCriticalSection(mut)
 
 #define thread_start(t) ((t)->thread = (HANDLE) _beginthread(tpool_worker, 0, t))
+#define thread_end(t) WaitForSingleObject((t)->thread, INFINITE)
 
 #define cond_init(cond) InitializeConditionVariable(cond)
 #define cond_broadcast(cond) WakeAllConditionVariable(cond)
 #define cond_signal(cond) WakeConditionVariable(cond)
 #define cond_wait(cond, mutex) SleepConditionVariableCS(cond, mutex, INFINITE)
+
 #endif
 
 typedef void tpool_task_proc(void *data);
@@ -81,6 +95,94 @@ typedef struct TPool {
 
 _Thread_local Thread *current_thread = NULL;
 _Thread_local int work_count = 0;
+
+#if defined(__linux__)
+void tpool_wake_addr(_Atomic int32_t *addr) {
+	for (;;) {
+		int ret = syscall(SYS_futex, addr, FUTEX_WAKE, 1, NULL, NULL, 0);
+		if (ret == -1) {
+			perror("Futex wake");
+			exit(1);
+		} else if (ret > 0) {
+			return;
+		}
+	}
+}
+
+void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
+	for (;;) {
+		int ret = syscall(SYS_futex, addr, FUTEX_WAIT, val, NULL, NULL, 0);
+		if (ret == -1) {
+			if (errno != EAGAIN) {
+				perror("Futex wait");
+				exit(1);
+			} else {
+				return;
+			}
+		} else if (ret == 0) {
+			if (*addr != val) {
+				return;
+			}
+		}
+	}
+}
+#elif defined(__APPLE__)
+
+#define UL_COMPARE_AND_WAIT	0x00000001
+#define ULF_NO_ERRNO        0x01000000
+
+int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout); /* timeout is specified in microseconds */
+int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+
+void tpool_wake_addr(_Atomic int32_t *addr) {
+	for (;;) {
+		int ret = __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, addr, 0);
+		if (ret >= 0) {
+			return;
+		}
+		if (ret == EINTR || ret == EFAULT) {
+			continue;
+		}
+		if (ret == ENOENT) {
+			return;
+		}
+		printf("futex wake fail?\n");
+		exit(1);
+	}
+}
+
+void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
+	for (;;) {
+		int ret = __ulock_wait(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, addr, val, 0);
+		if (ret >= 0) {
+			if (*addr != val) {
+				return;
+			}
+			continue;
+		}
+		if (ret == EINTR || ret == EFAULT) {
+			continue;
+		}
+		if (ret == ENOENT) {
+			return;
+		}
+
+		printf("futex wait fail?\n");
+		exit(1);
+	}
+}
+#elif defined(_WIN32)
+void tpool_wake_addr(_Atomic int32_t *addr) {
+	WakeByAddressSingle(addr);
+}
+
+void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
+	for (;;) {
+		int ret = WaitOnAddress(addr, &val, sizeof(val), INFINITE);
+		if (*addr != val) break;
+	}
+}
+#endif
 
 void tqueue_push(Thread *thread, TPoolTask task) {
 	uint64_t capture;
@@ -130,52 +232,6 @@ bool tqueue_pop(Thread *thread, TPoolTask *task) {
 	return true;
 }
 
-#ifndef _WIN32
-void tpool_wake_addr(_Atomic int32_t *addr) {
-	for (;;) {
-		int ret = syscall(SYS_futex, addr, FUTEX_WAKE, 1, NULL, NULL, 0);
-		if (ret == -1) {
-			perror("Futex wake");
-			exit(1);
-		} else if (ret > 0) {
-			return;
-		}
-	}
-}
-
-void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
-	for (;;) {
-		int ret = syscall(SYS_futex, addr, FUTEX_WAIT, val, NULL, NULL, 0);
-		if (ret == -1) {
-			if (errno != EAGAIN) {
-				perror("Futex wait");
-				exit(1);
-			} else {
-				return;
-			}
-		} else if (ret == 0) {
-			if (*addr != val) {
-				return;
-			}
-		}
-	}
-}
-#else
-void tpool_wake_addr(_Atomic int32_t *addr) {
-	WakeByAddressSingle(addr);
-}
-
-void tpool_wait_on_addr(_Atomic int32_t *addr, int32_t val) {
-	for (;;) {
-		int ret = WaitOnAddress(addr, &val, sizeof(val), INFINITE);
-		if (*addr != val) break;
-	}
-}
-
-void thread_end(Thread *t) {
-	WaitForSingleObject(t->thread, INFINITE);
-}
-#endif
 
 #ifndef _WIN32
 void *tpool_worker(void *ptr)
@@ -324,14 +380,15 @@ static float aaa[10000];
 _Atomic static int total_tasks = 0;
 void little_work(void *args) {
 	// this is my workload. enjoy
-	#ifndef _WIN32
+
+#ifndef _WIN32
 	int sleep_time = rand() % 201;
 	usleep(sleep_time);
-	#else
+#else
 	for (size_t i = 0; i < 10000; i++) {
 		aaa[i] = (rand() % 2000) * 0.25;
 	}
-	#endif
+#endif
 
 	if (total_tasks < 2000) {
 		for (int i = 0; i < 5; i++) {
@@ -351,7 +408,7 @@ int main(void) {
 	spall_auto_init("pool_test.spall");
 	spall_auto_thread_init(0, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
-	TPool *pool = tpool_init(32);
+	TPool *pool = tpool_init(6);
 
 	int initial_task_count = 10;
 
