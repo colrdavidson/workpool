@@ -4,10 +4,10 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdatomic.h>
 
 #if defined(__linux__) || defined(__APPLE__)
 
+#include <stdatomic.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <errno.h>
@@ -28,6 +28,41 @@ typedef pthread_cond_t CondVar;
 #define cond_signal(cond) pthread_cond_signal(cond)
 #define cond_wait(cond, mutex) pthread_cond_wait(cond, mutex)
 
+#elif defined(_WIN32) && defined(__clang__)
+
+#include <stdatomic.h>
+
+#elif defined(_WIN32) && !defined(__clang__)
+#define _Atomic volatile
+#define _Thread_local __declspec(thread)
+#endif
+
+#if !defined(__clang__)
+#define CAS32(addr, expected, desired) (InterlockedCompareExchange(addr, desired, expected) == expected)
+#define CAS64(addr, expected, desired) (InterlockedCompareExchange64(addr, desired, expected) == expected)
+
+#define ATOMIC_INC16(val) (_InterlockedIncrement16(&(val)))
+#define ATOMIC_INC32(val) (_InterlockedIncrement(&(val)))
+#define ATOMIC_INC64(val) (_InterlockedIncrement64(&(val)))
+#define ATOMIC_FUTEX_INC(val) (_InterlockedIncrement64(&(val)))
+
+#define ATOMIC_DEC16(val) (_InterlockedDecrement16(&(val)))
+#define ATOMIC_DEC32(val) (_InterlockedDecrement(&(val)))
+#define ATOMIC_DEC64(val) (_InterlockedDecrement64(&(val)))
+#define ATOMIC_FUTEX_DEC(val) (_InterlockedDecrement64(&(val)))
+#else
+#define CAS32(addr, expected, desired) atomic_compare_exchange_weak(addr, &expected, desired)
+#define CAS64(addr, expected, desired) atomic_compare_exchange_weak(addr, &expected, desired)
+
+#define ATOMIC_INC16(val) ((val)++)
+#define ATOMIC_INC32(val) ((val)++)
+#define ATOMIC_INC64(val) ((val)++)
+#define ATOMIC_FUTEX_INC(val) ((val)++)
+
+#define ATOMIC_DEC16(val) ((val)--)
+#define ATOMIC_DEC32(val) ((val)--)
+#define ATOMIC_DEC64(val) ((val)--)
+#define ATOMIC_FUTEX_DEC(val) ((val)--)
 #endif
 
 #if defined(__linux__)
@@ -35,13 +70,12 @@ typedef pthread_cond_t CondVar;
 #include <linux/futex.h>
 #include <sys/syscall.h>
 
-typedef int32_t Futex;
+typedef _Atomic int32_t Futex;
 
 #elif defined(__APPLE__)
 
-#include <sys/syscall.h>
+typedef _Atomic int64_t Futex;
 
-typedef int64_t Futex;
 #elif defined(_WIN32)
 
 #include <windows.h>
@@ -64,7 +98,7 @@ typedef CONDITION_VARIABLE CondVar;
 #define cond_signal(cond) WakeConditionVariable(cond)
 #define cond_wait(cond, mutex) SleepConditionVariableCS(cond, mutex, INFINITE)
 
-typedef int64_t Futex;
+typedef _Atomic int64_t Futex;
 #endif
 
 typedef void tpool_task_proc(void *data);
@@ -106,7 +140,7 @@ void tpool_wake_addr(Futex *addr) {
 		int ret = syscall(SYS_futex, addr, FUTEX_WAKE, 1, NULL, NULL, 0);
 		if (ret == -1) {
 			perror("Futex wake");
-			exit(1);
+			__debugbreak();
 		} else if (ret > 0) {
 			return;
 		}
@@ -119,7 +153,7 @@ void tpool_wait_on_addr(Futex *addr, Futex val) {
 		if (ret == -1) {
 			if (errno != EAGAIN) {
 				perror("Futex wait");
-				exit(1);
+				__debugbreak();
 			} else {
 				return;
 			}
@@ -151,7 +185,7 @@ void tpool_wake_addr(Futex *addr) {
 			return;
 		}
 		printf("futex wake fail?\n");
-		exit(1);
+		__debugbreak();
 	}
 }
 
@@ -172,17 +206,17 @@ void tpool_wait_on_addr(Futex *addr, Futex val) {
 		}
 
 		printf("futex wait fail?\n");
-		exit(1);
+		__debugbreak();
 	}
 }
 #elif defined(_WIN32)
 void tpool_wake_addr(Futex *addr) {
-	WakeByAddressSingle(addr);
+	WakeByAddressSingle((void *)addr);
 }
 
 void tpool_wait_on_addr(Futex *addr, Futex val) {
 	for (;;) {
-		int ret = WaitOnAddress(addr, &val, sizeof(val), INFINITE);
+		int ret = WaitOnAddress(addr, (void *)&val, sizeof(val), INFINITE);
 		if (*addr != val) break;
 	}
 }
@@ -200,15 +234,15 @@ void tqueue_push(Thread *thread, TPoolTask task) {
 
 		uint64_t new_head = (head + 1) & mask;
 		if (new_head == tail) {
-			exit(1);
+			__debugbreak();
 		}
 
 		// This *must* be done in here, to avoid a potential race condition where we no longer own the slot by the time we're assigning
 		thread->queue[head] = task;
 		new_capture = (new_head << 32) | tail;
-	} while (!atomic_compare_exchange_weak(&thread->head_and_tail, &capture, new_capture));
+	} while (!CAS64(&thread->head_and_tail, capture, new_capture));
 
-	thread->pool->tasks_left++;
+	ATOMIC_FUTEX_INC(thread->pool->tasks_left);
 	cond_broadcast(&thread->pool->tasks_available);
 }
 
@@ -231,7 +265,7 @@ bool tqueue_pop(Thread *thread, TPoolTask *task) {
 		*task = thread->queue[tail];
 
 		new_capture = (head << 32) | new_tail;
-	} while (!atomic_compare_exchange_weak(&thread->head_and_tail, &capture, new_capture));
+	} while (!CAS64(&thread->head_and_tail, capture, new_capture));
 
 	return true;
 }
@@ -258,7 +292,7 @@ void tpool_worker(void *ptr)
 		size_t finished_tasks = 0;
 		while (tqueue_pop(current_thread, &task)) {
 			task.do_work(task.args);
-			pool->tasks_left--;
+			ATOMIC_FUTEX_DEC(pool->tasks_left);
 
 			finished_tasks += 1;
 		}
@@ -283,7 +317,7 @@ void tpool_worker(void *ptr)
 				}
 
 				task.do_work(task.args);
-				pool->tasks_left--;
+				ATOMIC_FUTEX_DEC(pool->tasks_left);
 
 				if (!pool->tasks_left) {
 					tpool_wake_addr(&pool->tasks_left);
@@ -315,7 +349,7 @@ void tpool_wait(TPool *pool) {
 		// if we've got tasks on our queue, run them
 		while (tqueue_pop(current_thread, &task)) {
 			task.do_work(task.args);
-			pool->tasks_left--;
+			ATOMIC_FUTEX_DEC(pool->tasks_left);
 		}
 
 
@@ -403,7 +437,7 @@ void little_work(void *args) {
 		}
 	}
 
-	total_tasks++;
+	ATOMIC_INC32(total_tasks);
 }
 
 
@@ -412,7 +446,7 @@ int main(void) {
 	spall_auto_init("pool_test.spall");
 	spall_auto_thread_init(0, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
-	TPool *pool = tpool_init(6);
+	TPool *pool = tpool_init(32);
 
 	int initial_task_count = 10;
 
