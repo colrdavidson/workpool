@@ -324,8 +324,8 @@ static float aaa[10000];
 _Atomic static int total_tasks = 0;
 void little_work(void *args) {
 	// this is my workload. enjoy
-	int sleep_time = rand() % 201;
 	#ifndef _WIN32
+	int sleep_time = rand() % 201;
 	usleep(sleep_time);
 	#else
 	for (size_t i = 0; i < 10000; i++) {
@@ -389,6 +389,4 @@ int main(void) {
 }
 
 #define SPALL_AUTO_IMPLEMENTATION
-#define SPALL_BUFFER_PROFILING
-#define SPALL_BUFFER_PROFILING_GET_TIME() __rdtsc()
 #include "spall_auto.h"

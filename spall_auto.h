@@ -166,10 +166,10 @@ extern "C" {
 			WaitOnAddress(&sym_lock, &locked, sizeof(locked), INFINITE);
 		}
 		{
-			char temp_data[512];
-			SpallBuffer temp = { temp_data, sizeof(temp_data) };
-			spall_buffer_init(&spall_ctx, &temp);
-			double start = (double)__rdtsc();
+			//char temp_data[512];
+			//SpallBuffer temp = { temp_data, sizeof(temp_data) };
+			//spall_buffer_init(&spall_ctx, &temp);
+			//double start = (double)__rdtsc();
 			if (SymFromAddr(process, (DWORD64)addr, NULL, &symbol.si)) {
 				char *str = symbol.si.Name;
 				size_t len = symbol.si.NameLen;
@@ -179,9 +179,9 @@ extern "C" {
 				*name_ret = name;
 				result = true;
 			}
-			spall_buffer_begin_args(&spall_ctx, &temp, "Symbol Resolve", sizeof("Symbol Resolve") - 1, symbol.si.Name, symbol.si.NameLen, start, tid, 0);
-			spall_buffer_end_ex(&spall_ctx, &temp, (double)__rdtsc(), tid, 0);
-			spall_buffer_quit(&spall_ctx, &temp);
+			//spall_buffer_begin_args(&spall_ctx, &temp, "Symbol Resolve", sizeof("Symbol Resolve") - 1, symbol.si.Name, symbol.si.NameLen, start, tid, 0);
+			//spall_buffer_end_ex(&spall_ctx, &temp, (double)__rdtsc(), tid, 0);
+			//spall_buffer_quit(&spall_ctx, &temp);
 		}
 		InterlockedExchange(&sym_lock, 0);
 		WakeByAddressSingle(&sym_lock);
@@ -512,7 +512,7 @@ extern "C" {
 	}
 
 	void spall_auto_init(char *filename) {
-		spall_ctx = spall_init_file_ex(filename, get_rdtsc_multiplier(), true);
+		spall_ctx = spall_init_file_ex(filename, get_rdtsc_multiplier(), false);
 		ah_init(&global_addr_map, 10000);
 		load_self(&global_addr_map);
 		#if _WIN32
@@ -523,7 +523,7 @@ extern "C" {
 			SpallBuffer temp = { temp_data, sizeof(temp_data) };
 			spall_buffer_init(&spall_ctx, &temp);
 			spall_buffer_begin(&spall_ctx, &temp, "SymInitialize", sizeof("SymInitialize") - 1, (double)__rdtsc());
-			SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_FAIL_CRITICAL_ERRORS);
+			SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_DEFERRED_LOADS);
 			SymInitialize(process, NULL, TRUE);
 			spall_buffer_end(&spall_ctx, &temp, (double)__rdtsc());
 			spall_buffer_quit(&spall_ctx, &temp);
