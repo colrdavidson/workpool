@@ -172,7 +172,7 @@ SPALL_FN bool get_addr_name(void *addr, Name *name_ret) {
             char *str = symbol.si.Name;
             size_t len = symbol.si.NameLen;
             Name name;
-            name.str = memcpy(calloc(len + 1, 1), (void *)str, len);
+            name.str = (char *)memcpy(calloc(len + 1, 1), (void *)str, len);
             name.len = (int)len;
             *name_ret = name;
             result = true;
