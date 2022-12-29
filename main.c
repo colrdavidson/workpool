@@ -376,9 +376,7 @@ void thread_init(TPool *pool, Thread *thread, int idx) {
 	thread->idx = idx;
 }
 
-TPool *tpool_init(int child_thread_count) {
-	TPool *pool = calloc(sizeof(TPool), 1);
-
+void tpool_init(TPool *pool, int child_thread_count) {
 	int thread_count = child_thread_count + 1;
 	pool->thread_count = thread_count;
 	pool->threads = malloc(sizeof(Thread) * pool->thread_count);
@@ -395,8 +393,6 @@ TPool *tpool_init(int child_thread_count) {
 		thread_init(pool, &pool->threads[i], i);
 		thread_start(&pool->threads[i]);
 	}
-
-	return pool;
 }
 
 void tpool_destroy(TPool *pool) {
@@ -411,7 +407,6 @@ void tpool_destroy(TPool *pool) {
 	}
 
 	free(pool->threads);
-	free(pool);
 }
 
 static float aaa[10000];
@@ -447,7 +442,8 @@ int main(void) {
 	spall_auto_init("pool_test.spall");
 	spall_auto_thread_init(0, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
-	TPool *pool = tpool_init(32);
+	TPool pool = {};
+	tpool_init(&pool, 32);
 
 	int initial_task_count = 10;
 
@@ -458,7 +454,7 @@ int main(void) {
 		tqueue_push(current_thread, task);
 	}
 
-	tpool_wait(pool);
+	tpool_wait(&pool);
 
 	total_tasks = 0;
 	for (int i = 0; i < initial_task_count; i++) {
@@ -468,7 +464,7 @@ int main(void) {
 		tqueue_push(current_thread, task);
 	}
 
-	tpool_wait(pool);
+	tpool_wait(&pool);
 
 	total_tasks = 0;
 	for (int i = 0; i < initial_task_count; i++) {
@@ -477,8 +473,8 @@ int main(void) {
 		task.args = NULL;
 		tqueue_push(current_thread, task);
 	}
-	tpool_wait(pool);
-	tpool_destroy(pool);
+	tpool_wait(&pool);
+	tpool_destroy(&pool);
 
 	spall_auto_thread_quit();
 	spall_auto_quit();
