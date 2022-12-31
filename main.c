@@ -1,4 +1,3 @@
-#include "spall_auto.h"
 #include "pool.h"
 
 #if !defined(__clang__)
@@ -36,8 +35,6 @@ void little_work(TPool *pool, void *args) {
 
 int main(void) {
 	srand(1);
-	spall_auto_init("pool_test.spall");
-	spall_auto_thread_init(0, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
 	TPool pool = {};
 	tpool_init(&pool, 32);
@@ -69,10 +66,4 @@ int main(void) {
 	}
 	tpool_wait(&pool);
 	tpool_destroy(&pool);
-
-	spall_auto_thread_quit();
-	spall_auto_quit();
 }
-
-#define SPALL_AUTO_IMPLEMENTATION
-#include "spall_auto.h"

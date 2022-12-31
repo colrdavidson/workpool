@@ -282,7 +282,6 @@ void _tpool_worker(void *ptr)
 	TPool_Thread *current_thread = (TPool_Thread *)ptr;
 	int tpool_current_thread_idx = current_thread->idx;
 	TPool *pool = current_thread->pool;
-	spall_auto_thread_init(current_thread->idx, SPALL_DEFAULT_BUFFER_SIZE, SPALL_DEFAULT_SYMBOL_CACHE_SIZE);
 
 	for (;;) {
         work_start:
@@ -335,7 +334,6 @@ void _tpool_worker(void *ptr)
 		tpool_mutex_unlock(&pool->task_lock);
 	}
 
-	spall_auto_thread_quit();
 #ifndef _WIN32
 	return NULL;
 #endif
