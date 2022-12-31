@@ -1,6 +1,6 @@
 #include "pool.h"
 
-#if !defined(__clang__)
+#if defined(_MSC_VER)
 #define ATOMIC_INC32(val) (_InterlockedIncrement(&(val)))
 #else
 #define ATOMIC_INC32(val) ((val)++)

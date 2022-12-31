@@ -56,7 +56,7 @@ typedef CONDITION_VARIABLE TPool_CondVar;
 
 // MSVC only took 11 years to put C11 atomics in, (despite the fact that MSVC/C++11 has them).
 // This is the pain we suffer because microsoft got lazy
-#if !defined(__clang__)
+#if defined(_MSC_VER)
 
 #define TPool_Thread_Local __declspec(thread)
 #define TPool_Atomic volatile
