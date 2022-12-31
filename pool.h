@@ -178,6 +178,76 @@ void _tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
 		if (*addr != val) break;
 	}
 }
+
+#elif defined(__FreeBSD__)
+
+#include <sys/types.h>
+#include <sys/umtx.h>
+
+typedef TPool_Atomic int32_t TPool_Futex;
+
+void tpool_wake_addr(TPool_Futex *addr) {
+	_umtx_op(addr, UMTX_OP_WAKE, 1, 0, 0);
+}
+
+void tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
+	for (;;) {
+		int ret = _umtx_op(addr, UMTX_OP_WAIT_UINT, val, 0, NULL);
+		if (ret == 0) {
+			if (errno == ETIMEDOUT || errno == EINTR) {
+				continue;
+			}
+
+			perror("Futex wait");
+			__debugbreak();
+		} else if (ret == 0) {
+			if (*addr != val) {
+				return;
+			}
+		}
+	}
+}
+
+#elif defined(__OpenBSD__)
+
+#include <sys/futex.h>
+
+typedef TPool_Atomic int32_t TPool_Futex;
+
+void tpool_wake_addr(TPool_Futex *addr) {
+	for (;;) {
+		int ret = futex(addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, NULL, NULL);
+		if (ret == -1) {
+			if (errno == ETIMEDOUT || errno == EINTR) {
+				continue;
+			}
+
+			perror("Futex wake");
+			__debugbreak();
+		} else if (ret == 1) {
+			return;
+		}
+	}
+}
+
+void tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
+	for (;;) {
+		int ret = futex(addr, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, val, NULL, NULL);
+		if (ret == -1) {
+			if (*addr != val) {
+				return;
+			}
+
+			if (errno == ETIMEDOUT || errno == EINTR) {
+				continue;
+			}
+
+			perror("Futex wait");
+			__debugbreak();
+		}
+	}
+}
+
 #endif
 
 struct TPool;
