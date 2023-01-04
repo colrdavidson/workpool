@@ -7,4 +7,4 @@ Darwin)
 	;;
 esac
 
-clang -g -O3 -o pool $OS_FLAGS -ldl -lpthread -finstrument-functions main.c
+clang -g -O3 -Wall -o pool $OS_FLAGS -ldl -lpthread -finstrument-functions main.c

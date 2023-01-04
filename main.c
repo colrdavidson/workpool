@@ -6,7 +6,6 @@
 #define ATOMIC_INC32(val) ((val)++)
 #endif
 
-static float aaa[10000];
 
 _Atomic static int total_tasks = 0;
 void little_work(TPool *pool, void *args) {
@@ -16,6 +15,7 @@ void little_work(TPool *pool, void *args) {
 	int sleep_time = rand() % 201;
 	usleep(sleep_time);
 #else
+	static float aaa[10000];
 	for (size_t i = 0; i < 10000; i++) {
 		aaa[i] = (rand() % 2000) * 0.25;
 	}
@@ -36,7 +36,7 @@ void little_work(TPool *pool, void *args) {
 int main(void) {
 	srand(1);
 
-	TPool pool = {};
+	TPool pool = {0};
 	tpool_init(&pool, 32);
 
 	int initial_task_count = 10;

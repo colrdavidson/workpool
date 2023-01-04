@@ -14,21 +14,10 @@
 #include <unistd.h>
 #include <errno.h>
 
-typedef pthread_mutex_t TPool_Mutex;
 typedef pthread_t TPool_ThreadHandle;
-typedef pthread_cond_t TPool_CondVar;
-
-#define tpool_mutex_init(mut) pthread_mutex_init(mut, NULL)
-#define tpool_mutex_lock(mut) pthread_mutex_lock(mut)
-#define tpool_mutex_unlock(mut) pthread_mutex_unlock(mut)
 
 #define tpool_thread_start(t) pthread_create(&(t)->thread, NULL, _tpool_worker, (void *) (t))
 #define tpool_thread_end(t)   pthread_join((t)->thread, NULL)
-
-#define tpool_cond_init(cond) pthread_cond_init(cond, NULL)
-#define tpool_cond_broadcast(cond) pthread_cond_broadcast(cond)
-#define tpool_cond_signal(cond) pthread_cond_signal(cond)
-#define tpool_cond_wait(cond, mutex) pthread_cond_wait(cond, mutex)
 
 #elif defined(_WIN32)
 
@@ -36,21 +25,10 @@ typedef pthread_cond_t TPool_CondVar;
 #include <process.h>
 
 typedef ptrdiff_t ssize_t;
-typedef CRITICAL_SECTION TPool_Mutex;
 typedef HANDLE TPool_ThreadHandle;
-typedef CONDITION_VARIABLE TPool_CondVar;
-
-#define tpool_mutex_init(mut) InitializeCriticalSection(mut)
-#define tpool_mutex_lock(mut) EnterCriticalSection(mut)
-#define tpool_mutex_unlock(mut) LeaveCriticalSection(mut)
 
 #define tpool_thread_start(t) ((t)->thread = (HANDLE) _beginthread(_tpool_worker, 0, t))
 #define tpool_thread_end(t) WaitForSingleObject((t)->thread, INFINITE)
-
-#define tpool_cond_init(cond) InitializeConditionVariable(cond)
-#define tpool_cond_broadcast(cond) WakeAllConditionVariable(cond)
-#define tpool_cond_signal(cond) WakeConditionVariable(cond)
-#define tpool_cond_wait(cond, mutex) SleepConditionVariableCS(cond, mutex, INFINITE)
 
 #endif
 
@@ -88,21 +66,24 @@ typedef CONDITION_VARIABLE TPool_CondVar;
 
 typedef TPool_Atomic int32_t TPool_Futex;
 
-void _tpool_wake_addr(TPool_Futex *addr) {
-	for (;;) {
-		int ret = syscall(SYS_futex, addr, FUTEX_WAKE, 1, NULL, NULL, 0);
-		if (ret == -1) {
-			perror("Futex wake");
-			__debugbreak();
-		} else if (ret > 0) {
-			return;
-		}
+void _tpool_signal(TPool_Futex *addr) {
+	int ret = syscall(SYS_futex, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, NULL, NULL, 0);
+	if (ret == -1) {
+		perror("Futex wake");
+		__debugbreak();
+	}
+}
+void _tpool_broadcast(TPool_Futex *addr) {
+	int ret = syscall(SYS_futex, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, INT32_MAX, NULL, NULL, 0);
+	if (ret == -1) {
+		perror("Futex wake");
+		__debugbreak();
 	}
 }
 
-void _tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
+void _tpool_wait(TPool_Futex *addr, TPool_Futex val) {
 	for (;;) {
-		int ret = syscall(SYS_futex, addr, FUTEX_WAIT, val, NULL, NULL, 0);
+		int ret = syscall(SYS_futex, addr, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, val, NULL, NULL, 0);
 		if (ret == -1) {
 			if (errno != EAGAIN) {
 				perror("Futex wait");
@@ -117,6 +98,7 @@ void _tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
 		}
 	}
 }
+
 #elif defined(__APPLE__)
 
 typedef TPool_Atomic int64_t TPool_Futex;
@@ -128,12 +110,13 @@ typedef TPool_Atomic int64_t TPool_Futex;
 int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout); 
 int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
 
-void _tpool_wake_addr(TPool_Futex *addr) {
+void _tpool_signal(TPool_Futex *addr) {
 	for (;;) {
 		int ret = __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, addr, 0);
 		if (ret >= 0) {
 			return;
 		}
+		ret = -ret;
 		if (ret == EINTR || ret == EFAULT) {
 			continue;
 		}
@@ -145,7 +128,7 @@ void _tpool_wake_addr(TPool_Futex *addr) {
 	}
 }
 
-void _tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
+void _tpool_wait(TPool_Futex *addr, TPool_Futex val) {
 	for (;;) {
 		int ret = __ulock_wait(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, addr, val, 0);
 		if (ret >= 0) {
@@ -154,6 +137,7 @@ void _tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
 			}
 			continue;
 		}
+		ret = -ret;
 		if (ret == EINTR || ret == EFAULT) {
 			continue;
 		}
@@ -165,14 +149,15 @@ void _tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
 		__debugbreak();
 	}
 }
+
 #elif defined(_WIN32)
 typedef TPool_Atomic int64_t TPool_Futex;
 
-void _tpool_wake_addr(TPool_Futex *addr) {
+void _tpool_signal(TPool_Futex *addr) {
 	WakeByAddressSingle((void *)addr);
 }
 
-void _tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
+void _tpool_wait(TPool_Futex *addr, TPool_Futex val) {
 	for (;;) {
 		int ret = WaitOnAddress(addr, (void *)&val, sizeof(val), INFINITE);
 		if (*addr != val) break;
@@ -186,11 +171,11 @@ void _tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
 
 typedef TPool_Atomic int32_t TPool_Futex;
 
-void tpool_wake_addr(TPool_Futex *addr) {
+void tpool_signal(TPool_Futex *addr) {
 	_umtx_op(addr, UMTX_OP_WAKE, 1, 0, 0);
 }
 
-void tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
+void tpool_wait(TPool_Futex *addr, TPool_Futex val) {
 	for (;;) {
 		int ret = _umtx_op(addr, UMTX_OP_WAIT_UINT, val, 0, NULL);
 		if (ret == 0) {
@@ -214,7 +199,7 @@ void tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
 
 typedef TPool_Atomic int32_t TPool_Futex;
 
-void tpool_wake_addr(TPool_Futex *addr) {
+void tpool_signal(TPool_Futex *addr) {
 	for (;;) {
 		int ret = futex(addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, NULL, NULL);
 		if (ret == -1) {
@@ -230,7 +215,7 @@ void tpool_wake_addr(TPool_Futex *addr) {
 	}
 }
 
-void tpool_wait_on_addr(TPool_Futex *addr, TPool_Futex val) {
+void tpool_wait(TPool_Futex *addr, TPool_Futex val) {
 	for (;;) {
 		int ret = futex(addr, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, val, NULL, NULL);
 		if (ret == -1) {
@@ -276,9 +261,7 @@ typedef struct TPool {
 	int thread_count;
 	TPool_Atomic bool running;
 
-	TPool_CondVar tasks_available;
-	TPool_Mutex task_lock;
-
+	TPool_Futex tasks_available;
 	TPool_Futex tasks_left;
 } TPool;
 
@@ -313,7 +296,8 @@ void _tpool_queue_push(TPool_Thread *thread, TPool_Task task) {
 	} while (!TPOOL_CAS(&thread->head_and_tail, capture, new_capture));
 
 	TPOOL_ATOMIC_FUTEX_INC(thread->pool->tasks_left);
-	tpool_cond_broadcast(&thread->pool->tasks_available);
+	TPOOL_ATOMIC_FUTEX_INC(thread->pool->tasks_available);
+	_tpool_broadcast(&thread->pool->tasks_available);
 }
 
 bool _tpool_queue_pop(TPool_Thread *thread, TPool_Task *task) {
@@ -348,9 +332,8 @@ void _tpool_worker(void *ptr)
 #endif
 {
 	TPool_Task task;
-
 	TPool_Thread *current_thread = (TPool_Thread *)ptr;
-	int tpool_current_thread_idx = current_thread->idx;
+	tpool_current_thread_idx = current_thread->idx;
 	TPool *pool = current_thread->pool;
 
 	for (;;) {
@@ -368,7 +351,7 @@ void _tpool_worker(void *ptr)
 			finished_tasks += 1;
 		}
 		if (finished_tasks > 0 && !pool->tasks_left) {
-			_tpool_wake_addr(&pool->tasks_left);
+			_tpool_signal(&pool->tasks_left);
 		}
 
 		// If there's still work somewhere and we don't have it, steal it
@@ -391,7 +374,7 @@ void _tpool_worker(void *ptr)
 				TPOOL_ATOMIC_FUTEX_DEC(pool->tasks_left);
 
 				if (!pool->tasks_left) {
-					_tpool_wake_addr(&pool->tasks_left);
+					_tpool_signal(&pool->tasks_left);
 				}
 
 				goto work_start;
@@ -399,9 +382,8 @@ void _tpool_worker(void *ptr)
 		}
 
 		// if we've done all our work, and there's nothing to steal, go to sleep
-		tpool_mutex_lock(&pool->task_lock);
-		int ret = tpool_cond_wait(&pool->tasks_available, &pool->task_lock);
-		tpool_mutex_unlock(&pool->task_lock);
+		int32_t state = pool->tasks_available;
+		_tpool_wait(&pool->tasks_available, state);
 	}
 
 #ifndef _WIN32
@@ -436,7 +418,7 @@ void tpool_wait(TPool *pool) {
 			break;
 		}
 
-		_tpool_wait_on_addr(&pool->tasks_left, rem_tasks);
+		_tpool_wait(&pool->tasks_left, rem_tasks);
 	}
 }
 
@@ -445,8 +427,6 @@ void tpool_init(TPool *pool, int child_thread_count) {
 	pool->thread_count = thread_count;
 	pool->threads = malloc(sizeof(TPool_Thread) * pool->thread_count);
 
-	tpool_cond_init(&pool->tasks_available);
-	tpool_mutex_init(&pool->task_lock);
 	pool->running = true;
 
 	// setup the main thread
@@ -462,8 +442,8 @@ void tpool_init(TPool *pool, int child_thread_count) {
 void tpool_destroy(TPool *pool) {
 	pool->running = false;
 	for (int i = 1; i < pool->thread_count; i++) {
-		TPool_Thread *thread = &pool->threads[i];
-		tpool_cond_broadcast(&pool->tasks_available);
+		TPOOL_ATOMIC_FUTEX_INC(pool->tasks_available);
+		_tpool_broadcast(&pool->tasks_available);
 		tpool_thread_end(&pool->threads[i]);
 	}
 	for (int i = 0; i < pool->thread_count; i++) {
