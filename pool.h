@@ -39,6 +39,7 @@ typedef HANDLE TPool_ThreadHandle;
 #define TPool_Thread_Local __declspec(thread)
 #define TPool_Atomic volatile
 
+#define TPOOL_LOAD(val) val
 #define TPOOL_CAS(addr, expected, desired) (InterlockedCompareExchange64(addr, desired, expected) == expected)
 #define TPOOL_ATOMIC_FUTEX_INC(val) (_InterlockedIncrement64(&(val)))
 #define TPOOL_ATOMIC_FUTEX_DEC(val) (_InterlockedDecrement64(&(val)))
@@ -50,9 +51,10 @@ typedef HANDLE TPool_ThreadHandle;
 #define TPool_Thread_Local _Thread_local
 #define TPool_Atomic _Atomic
 
+#define TPOOL_LOAD(val) atomic_load(&val)
 #define TPOOL_CAS(addr, expected, desired) atomic_compare_exchange_weak(addr, &expected, desired)
-#define TPOOL_ATOMIC_FUTEX_INC(val) ((val)++)
-#define TPOOL_ATOMIC_FUTEX_DEC(val) ((val)--)
+#define TPOOL_ATOMIC_FUTEX_INC(val) (atomic_fetch_add_explicit(&val, 1, memory_order_relaxed))
+#define TPOOL_ATOMIC_FUTEX_DEC(val) (atomic_fetch_sub_explicit(&val, 1, memory_order_relaxed))
 #define __debugbreak() __builtin_trap()
 
 #endif
@@ -278,7 +280,7 @@ void _tpool_queue_push(TPool_Thread *thread, TPool_Task task) {
 	uint64_t capture;
 	uint64_t new_capture;
 	do {
-		capture = thread->head_and_tail;
+		capture = TPOOL_LOAD(thread->head_and_tail);
 
 		uint64_t mask = thread->capacity - 1;
 		uint64_t head = (capture >> 32) & mask;
@@ -304,7 +306,7 @@ bool _tpool_queue_pop(TPool_Thread *thread, TPool_Task *task) {
 	uint64_t capture;
 	uint64_t new_capture;
 	do {
-		capture = thread->head_and_tail;
+		capture = TPOOL_LOAD(thread->head_and_tail);
 
 		uint64_t mask = thread->capacity - 1;
 		uint64_t head = (capture >> 32) & mask;
@@ -350,15 +352,15 @@ void _tpool_worker(void *ptr)
 
 			finished_tasks += 1;
 		}
-		if (finished_tasks > 0 && !pool->tasks_left) {
+		if (finished_tasks > 0 && !TPOOL_LOAD(pool->tasks_left)) {
 			_tpool_signal(&pool->tasks_left);
 		}
 
 		// If there's still work somewhere and we don't have it, steal it
-		if (pool->tasks_left) {
+		if (TPOOL_LOAD(pool->tasks_left)) {
 			int idx = current_thread->idx;
 			for (int i = 0; i < pool->thread_count; i++) {
-				if (!pool->tasks_left) {
+				if (!TPOOL_LOAD(pool->tasks_left)) {
 					break;
 				}
 
@@ -373,7 +375,7 @@ void _tpool_worker(void *ptr)
 				task.do_work(pool, task.args);
 				TPOOL_ATOMIC_FUTEX_DEC(pool->tasks_left);
 
-				if (!pool->tasks_left) {
+				if (!TPOOL_LOAD(pool->tasks_left)) {
 					_tpool_signal(&pool->tasks_left);
 				}
 
@@ -400,7 +402,7 @@ void tpool_wait(TPool *pool) {
 	TPool_Task task;
 	TPool_Thread *current_thread = &pool->threads[tpool_current_thread_idx];
 
-	while (pool->tasks_left) {
+	while (TPOOL_LOAD(pool->tasks_left)) {
 
 		// if we've got tasks on our queue, run them
 		while (_tpool_queue_pop(current_thread, &task)) {
@@ -413,7 +415,7 @@ void tpool_wait(TPool *pool) {
 		// This *must* be executed in this order, so the futex wakes immediately
 		// if rem_tasks has changed since we checked last, otherwise the program
 		// will permanently sleep
-		TPool_Futex rem_tasks = pool->tasks_left;
+		TPool_Futex rem_tasks = TPOOL_LOAD(pool->tasks_left);
 		if (!rem_tasks) {
 			break;
 		}

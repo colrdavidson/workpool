@@ -3,7 +3,7 @@
 #if defined(_MSC_VER)
 #define ATOMIC_INC32(val) (_InterlockedIncrement(&(val)))
 #else
-#define ATOMIC_INC32(val) ((val)++)
+#define ATOMIC_INC32(val) (atomic_fetch_add_explicit(&val, 1, memory_order_relaxed))
 #endif
 
 
