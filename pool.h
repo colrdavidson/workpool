@@ -427,7 +427,7 @@ void _tpool_worker(void *ptr)
 		}
 
 		// if we've done all our work, and there's nothing to steal, go to sleep
-		int32_t state = pool->tasks_available;
+		int32_t state = TPOOL_LOAD(pool->tasks_available);
 		_tpool_wait(&pool->tasks_available, state);
 	}
 
