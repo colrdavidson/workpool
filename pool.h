@@ -106,6 +106,7 @@ void _tpool_wait(TPool_Futex *addr, TPool_Futex val) {
 typedef TPool_Atomic int64_t TPool_Futex;
 
 #define UL_COMPARE_AND_WAIT	0x00000001
+#define ULF_WAKE_ALL        0x00000100
 #define ULF_NO_ERRNO        0x01000000
 
 /* timeout is specified in microseconds */
@@ -115,6 +116,24 @@ int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
 void _tpool_signal(TPool_Futex *addr) {
 	for (;;) {
 		int ret = __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, addr, 0);
+		if (ret >= 0) {
+			return;
+		}
+		ret = -ret;
+		if (ret == EINTR || ret == EFAULT) {
+			continue;
+		}
+		if (ret == ENOENT) {
+			return;
+		}
+		printf("futex wake fail?\n");
+		__debugbreak();
+	}
+}
+
+void _tpool_broadcast(TPool_Futex *addr) {
+	for (;;) {
+		int ret = __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO | ULF_WAKE_ALL, addr, 0);
 		if (ret >= 0) {
 			return;
 		}
@@ -159,6 +178,10 @@ void _tpool_signal(TPool_Futex *addr) {
 	WakeByAddressSingle((void *)addr);
 }
 
+void _tpool_broadcast(TPool_Futex *addr) {
+	WakeByAddressAll((void *)addr);
+}
+
 void _tpool_wait(TPool_Futex *addr, TPool_Futex val) {
 	for (;;) {
 		int ret = WaitOnAddress(addr, (void *)&val, sizeof(val), INFINITE);
@@ -173,11 +196,15 @@ void _tpool_wait(TPool_Futex *addr, TPool_Futex val) {
 
 typedef TPool_Atomic int32_t TPool_Futex;
 
-void tpool_signal(TPool_Futex *addr) {
+void _tpool_signal(TPool_Futex *addr) {
 	_umtx_op(addr, UMTX_OP_WAKE, 1, 0, 0);
 }
 
-void tpool_wait(TPool_Futex *addr, TPool_Futex val) {
+void _tpool_broadcast(TPool_Futex *addr) {
+	_umtx_op(addr, UMTX_OP_WAKE, INT32_MAX, 0, 0);
+}
+
+void _tpool_wait(TPool_Futex *addr, TPool_Futex val) {
 	for (;;) {
 		int ret = _umtx_op(addr, UMTX_OP_WAIT_UINT, val, 0, NULL);
 		if (ret == 0) {
@@ -201,7 +228,7 @@ void tpool_wait(TPool_Futex *addr, TPool_Futex val) {
 
 typedef TPool_Atomic int32_t TPool_Futex;
 
-void tpool_signal(TPool_Futex *addr) {
+void _tpool_signal(TPool_Futex *addr) {
 	for (;;) {
 		int ret = futex(addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, NULL, NULL);
 		if (ret == -1) {
@@ -217,7 +244,23 @@ void tpool_signal(TPool_Futex *addr) {
 	}
 }
 
-void tpool_wait(TPool_Futex *addr, TPool_Futex val) {
+void _tpool_broadcast(TPool_Futex *addr) {
+	for (;;) {
+		int ret = futex(addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, INT32_MAX, NULL, NULL);
+		if (ret == -1) {
+			if (errno == ETIMEDOUT || errno == EINTR) {
+				continue;
+			}
+
+			perror("Futex wake");
+			__debugbreak();
+		} else if (ret == 1) {
+			return;
+		}
+	}
+}
+
+void _tpool_wait(TPool_Futex *addr, TPool_Futex val) {
 	for (;;) {
 		int ret = futex(addr, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, val, NULL, NULL);
 		if (ret == -1) {
