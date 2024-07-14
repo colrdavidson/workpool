@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef ENABLE_TRACING
+#include "spall_native_auto.h"
+#endif
+
 // cross-platform thread wrappers, because microsoft couldn't be arsed to take 5 seconds and 
 // do this and save all the junior devs and codebases everywhere from this pile of nonsense.
 #if defined(__linux__) || defined(__APPLE__)
@@ -381,6 +385,10 @@ void _tpool_worker(void *ptr)
 	tpool_current_thread_idx = current_thread->idx;
 	TPool *pool = current_thread->pool;
 
+#ifdef ENABLE_TRACING
+	spall_auto_thread_init(current_thread->idx, SPALL_DEFAULT_BUFFER_SIZE);
+#endif
+
 	for (;;) {
         work_start:
 		if (!pool->running) {
@@ -430,6 +438,10 @@ void _tpool_worker(void *ptr)
 		int32_t state = TPOOL_LOAD(pool->tasks_available);
 		_tpool_wait(&pool->tasks_available, state);
 	}
+
+#ifdef ENABLE_TRACING
+	spall_auto_thread_quit();
+#endif
 
 #ifndef _WIN32
 	return NULL;

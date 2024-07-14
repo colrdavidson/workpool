@@ -6,6 +6,9 @@
 #define ATOMIC_INC32(val) (atomic_fetch_add_explicit(&val, 1, memory_order_relaxed))
 #endif
 
+#ifdef ENABLE_TRACING
+#include "spall_native_auto.h"
+#endif
 
 _Atomic static int total_tasks = 0;
 void little_work(TPool *pool, void *args) {
@@ -34,10 +37,14 @@ void little_work(TPool *pool, void *args) {
 }
 
 int main(void) {
+#ifdef ENABLE_TRACING
+	spall_auto_init((char *)"profile.spall");
+	spall_auto_thread_init(0, SPALL_DEFAULT_BUFFER_SIZE);
+#endif
 	srand(1);
 
 	TPool pool = {0};
-	tpool_init(&pool, 32);
+	tpool_init(&pool, 8);
 
 	int initial_task_count = 10;
 	for (int i = 0; i < initial_task_count; i++) {
@@ -66,4 +73,14 @@ int main(void) {
 	}
 	tpool_wait(&pool);
 	tpool_destroy(&pool);
+
+#ifdef ENABLE_TRACING
+	spall_auto_thread_quit();
+	spall_auto_quit();
+#endif
 }
+
+#ifdef ENABLE_TRACING
+#define SPALL_AUTO_IMPLEMENTATION
+#include "spall_native_auto.h"
+#endif

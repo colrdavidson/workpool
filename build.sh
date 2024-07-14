@@ -7,4 +7,12 @@ Darwin)
 	;;
 esac
 
-clang -g -O3 -Wall -o pool $OS_FLAGS -ldl -lpthread main.c
+OPT_FLAGS=""
+case $1 in
+	-t)
+	OPT_FLAGS+="-finstrument-functions -D ENABLE_TRACING"
+	shift
+	;;
+esac
+
+clang -g -O3 -Wall -o pool $OS_FLAGS -ldl -lpthread $OPT_FLAGS main.c
