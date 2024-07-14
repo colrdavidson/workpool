@@ -14,6 +14,7 @@ _Atomic static int total_tasks = 0;
 void little_work(TPool *pool, void *args) {
 	// this is my workload. enjoy
 
+/*
 #ifndef _WIN32
 	int sleep_time = rand() % 201;
 	usleep(sleep_time);
@@ -32,6 +33,7 @@ void little_work(TPool *pool, void *args) {
 			tpool_add_task(pool, task);
 		}
 	}
+*/
 
 	ATOMIC_INC32(total_tasks);
 }
@@ -44,7 +46,7 @@ int main(void) {
 	srand(1);
 
 	TPool pool = {0};
-	tpool_init(&pool, 8);
+	tpool_init(&pool, 1);
 
 	int initial_task_count = 10;
 	for (int i = 0; i < initial_task_count; i++) {
@@ -55,6 +57,7 @@ int main(void) {
 	}
 	tpool_wait(&pool);
 
+/*
 	total_tasks = 0;
 	for (int i = 0; i < initial_task_count; i++) {
 		TPool_Task task;
@@ -71,6 +74,7 @@ int main(void) {
 		task.args = NULL;
 		tpool_add_task(&pool, task);
 	}
+*/
 	tpool_wait(&pool);
 	tpool_destroy(&pool);
 
