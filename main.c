@@ -10,6 +10,7 @@
 #include "spall_native_auto.h"
 #endif
 
+int thread_results[9] = {0};
 _Atomic static int total_tasks = 0;
 void little_work(TPool *pool, void *args) {
 	// this is my workload. enjoy
@@ -36,6 +37,13 @@ void little_work(TPool *pool, void *args) {
 	ATOMIC_INC32(total_tasks);
 }
 
+/*
+void little_work(TPool *pool, void *args) {
+	thread_results[tpool_current_thread_idx] += 1;
+	usleep(2);
+}
+*/
+
 int main(void) {
 #ifdef ENABLE_TRACING
 	spall_auto_init((char *)"profile.spall");
@@ -55,6 +63,13 @@ int main(void) {
 	}
 	tpool_wait(&pool);
 
+	int total_tasks = 0;
+	for (int i = 0; i < 9; i++) {
+		total_tasks += thread_results[i];
+	}
+	printf("%d\n", total_tasks);
+
+/*
 	total_tasks = 0;
 	for (int i = 0; i < initial_task_count; i++) {
 		TPool_Task task;
@@ -72,6 +87,7 @@ int main(void) {
 		tpool_add_task(&pool, task);
 	}
 	tpool_wait(&pool);
+*/
 	tpool_destroy(&pool);
 
 #ifdef ENABLE_TRACING

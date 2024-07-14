@@ -288,6 +288,10 @@ struct TPool;
 typedef void tpool_task_proc(struct TPool *pool, void *data);
 TPool_Thread_Local int tpool_current_thread_idx;
 
+#define GRAB_SUCCESS 0
+#define GRAB_EMPTY   1
+#define GRAB_FAILED  2
+
 typedef struct TPool_Task {
 	tpool_task_proc  *do_work;
 	void             *args;
@@ -377,7 +381,7 @@ void _tpool_queue_push(TPool_Thread *thread, TPool_Task task) {
 	_tpool_broadcast(&thread->pool->tasks_available);
 }
 
-bool _tpool_queue_take(TPool_Thread *thread, TPool_Task *task) {
+int _tpool_queue_take(TPool_Thread *thread, TPool_Task *task) {
 	ssize_t bot = atomic_load_explicit(&thread->queue.bottom, memory_order_relaxed) - 1;
 	TPool_RingBuffer *cur_ring = atomic_load_explicit(&thread->queue.ring, memory_order_relaxed);
 	atomic_store_explicit(&thread->queue.bottom, bot, memory_order_relaxed);
@@ -393,28 +397,28 @@ bool _tpool_queue_take(TPool_Thread *thread, TPool_Task *task) {
 			if (!atomic_compare_exchange_strong_explicit(&thread->queue.top, &top, top + 1, memory_order_seq_cst, memory_order_relaxed)) {
 				// Race failed
 				atomic_store_explicit(&thread->queue.bottom, bot + 1, memory_order_relaxed);
-				return false;
+				return GRAB_EMPTY;
 			}
 
 			atomic_store_explicit(&thread->queue.bottom, bot + 1, memory_order_relaxed);
-			return true;
+			return GRAB_SUCCESS;
 		}
 
 		// We got a task without hitting a race
-		return true;
+		return GRAB_SUCCESS;
 	} else {
 		// Queue is empty
 		atomic_store_explicit(&thread->queue.bottom, bot + 1, memory_order_relaxed);
-		return false;
+		return GRAB_EMPTY;
 	}
 }
 
-bool _tpool_queue_steal(TPool_Thread *thread, TPool_Task *task) {
+int _tpool_queue_steal(TPool_Thread *thread, TPool_Task *task) {
 	ssize_t top = atomic_load_explicit(&thread->queue.top, memory_order_acquire);
 	atomic_thread_fence(memory_order_seq_cst);
 	ssize_t bot = atomic_load_explicit(&thread->queue.bottom, memory_order_acquire);
 
-	bool ret = false;
+	int ret = GRAB_EMPTY;
 	if (top < bot) {
 		// Queue is not empty
 		TPool_RingBuffer *cur_ring = atomic_load_explicit(&thread->queue.ring, memory_order_consume);
@@ -422,9 +426,9 @@ bool _tpool_queue_steal(TPool_Thread *thread, TPool_Task *task) {
 
 		if (!atomic_compare_exchange_strong_explicit(&thread->queue.top, &top, top + 1, memory_order_seq_cst, memory_order_relaxed)) {
 			// Race failed
-			ret = false;
+			ret = GRAB_FAILED;
 		} else {
-			ret = true;
+			ret = GRAB_SUCCESS;
 		}
 	}
 	return ret;
@@ -453,7 +457,7 @@ void _tpool_worker(void *ptr)
 
 		// If we've got tasks to process, work through them
 		size_t finished_tasks = 0;
-		while (_tpool_queue_take(current_thread, &task)) {
+		while (!_tpool_queue_take(current_thread, &task)) {
 			task.do_work(pool, task.args);
 			TPOOL_ATOMIC_FUTEX_DEC(pool->tasks_left);
 
@@ -475,7 +479,10 @@ void _tpool_worker(void *ptr)
 				TPool_Thread *thread = &pool->threads[idx];
 
 				TPool_Task task;
-				if (!_tpool_queue_steal(thread, &task)) {
+				int ret = _tpool_queue_steal(thread, &task);
+				if (ret == GRAB_FAILED) {
+					goto work_start;
+				} else if (ret == GRAB_EMPTY) {
 					continue;
 				}
 
@@ -517,7 +524,7 @@ void tpool_wait(TPool *pool) {
 	while (TPOOL_LOAD(pool->tasks_left)) {
 
 		// if we've got tasks on our queue, run them
-		while (_tpool_queue_take(current_thread, &task)) {
+		while (!_tpool_queue_take(current_thread, &task)) {
 			task.do_work(pool, task.args);
 			TPOOL_ATOMIC_FUTEX_DEC(pool->tasks_left);
 		}
