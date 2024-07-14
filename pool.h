@@ -57,8 +57,8 @@ typedef HANDLE TPool_ThreadHandle;
 
 #define TPOOL_LOAD(val) atomic_load(&val)
 #define TPOOL_CAS(addr, expected, desired) atomic_compare_exchange_weak(addr, &expected, desired)
-#define TPOOL_ATOMIC_FUTEX_INC(val) (atomic_fetch_add_explicit(&val, 1, memory_order_relaxed))
-#define TPOOL_ATOMIC_FUTEX_DEC(val) (atomic_fetch_sub_explicit(&val, 1, memory_order_relaxed))
+#define TPOOL_ATOMIC_FUTEX_INC(val) (atomic_fetch_add_explicit(&val, 1, memory_order_acquire))
+#define TPOOL_ATOMIC_FUTEX_DEC(val) (atomic_fetch_sub_explicit(&val, 1, memory_order_acquire))
 #define __debugbreak() __builtin_trap()
 
 #endif
@@ -351,13 +351,12 @@ TPool_RingBuffer *tpool_ring_grow(TPool_RingBuffer *ring, ssize_t bottom, ssize_
 }
 
 void _thread_init(TPool *pool, TPool_Thread *thread, int idx) {
-	thread->queue = tpool_queue_make(1 << 14);
+	thread->queue = tpool_queue_make(1 << 1);
 	thread->pool = pool;
 	thread->idx = idx;
 }
 
 void _tpool_queue_push(TPool_Thread *thread, TPool_Task task) {
-	printf("%d | pushing task %p\n", thread->idx, task.do_work);
 	ssize_t bot                = atomic_load_explicit(&thread->queue.bottom, memory_order_relaxed);
 	ssize_t top                = atomic_load_explicit(&thread->queue.top,    memory_order_acquire);
 	TPool_RingBuffer *cur_ring = atomic_load_explicit(&thread->queue.ring,   memory_order_relaxed);
@@ -379,7 +378,6 @@ void _tpool_queue_push(TPool_Thread *thread, TPool_Task task) {
 }
 
 bool _tpool_queue_take(TPool_Thread *thread, TPool_Task *task) {
-	printf("%d | attempting to take\n", thread->idx);
 	ssize_t bot = atomic_load_explicit(&thread->queue.bottom, memory_order_relaxed) - 1;
 	TPool_RingBuffer *cur_ring = atomic_load_explicit(&thread->queue.ring, memory_order_relaxed);
 	atomic_store_explicit(&thread->queue.bottom, bot, memory_order_relaxed);
@@ -395,28 +393,23 @@ bool _tpool_queue_take(TPool_Thread *thread, TPool_Task *task) {
 			if (!atomic_compare_exchange_strong_explicit(&thread->queue.top, &top, top + 1, memory_order_seq_cst, memory_order_relaxed)) {
 				// Race failed
 				atomic_store_explicit(&thread->queue.bottom, bot + 1, memory_order_relaxed);
-				printf("%d | we failed the race\n", thread->idx);
 				return false;
 			}
 
 			atomic_store_explicit(&thread->queue.bottom, bot + 1, memory_order_relaxed);
-			printf("%d | we won the race %p\n", thread->idx, task->do_work);
 			return true;
 		}
 
 		// We got a task without hitting a race
-		printf("%d | took task easily %p\n", thread->idx, task->do_work);
 		return true;
 	} else {
 		// Queue is empty
 		atomic_store_explicit(&thread->queue.bottom, bot + 1, memory_order_relaxed);
-		printf("%d | queue is empty!\n", thread->idx);
 		return false;
 	}
 }
 
 bool _tpool_queue_steal(TPool_Thread *thread, TPool_Task *task) {
-	printf("%d | trying to steal from %d\n", tpool_current_thread_idx, thread->idx);
 	ssize_t top = atomic_load_explicit(&thread->queue.top, memory_order_acquire);
 	atomic_thread_fence(memory_order_seq_cst);
 	ssize_t bot = atomic_load_explicit(&thread->queue.bottom, memory_order_acquire);
@@ -433,12 +426,6 @@ bool _tpool_queue_steal(TPool_Thread *thread, TPool_Task *task) {
 		} else {
 			ret = true;
 		}
-	}
-
-	if (ret == true) {
-		printf("%d | stole task %p from %d\n", tpool_current_thread_idx, task->do_work, thread->idx);
-	} else {
-		printf("%d | failed to steal task from %d\n", tpool_current_thread_idx, thread->idx);
 	}
 	return ret;
 }
@@ -464,7 +451,6 @@ void _tpool_worker(void *ptr)
 			break;
 		}
 
-		printf("%d | checking for tasks\n", tpool_current_thread_idx);
 		// If we've got tasks to process, work through them
 		size_t finished_tasks = 0;
 		while (_tpool_queue_take(current_thread, &task)) {
@@ -477,7 +463,6 @@ void _tpool_worker(void *ptr)
 			_tpool_signal(&pool->tasks_left);
 		}
 
-		printf("check to see if there are things worth stealing\n");
 		// If there's still work somewhere and we don't have it, steal it
 		if (TPOOL_LOAD(pool->tasks_left)) {
 			int idx = current_thread->idx;
@@ -494,7 +479,6 @@ void _tpool_worker(void *ptr)
 					continue;
 				}
 
-				printf("Doing task on %d\n", tpool_current_thread_idx);
 				task.do_work(pool, task.args);
 				TPOOL_ATOMIC_FUTEX_DEC(pool->tasks_left);
 
@@ -504,15 +488,12 @@ void _tpool_worker(void *ptr)
 
 				goto work_start;
 			}
-		} else {
-			printf("Nope, I guess it's sleepy time\n");
 		}
 
 		// if we've done all our work, and there's nothing to steal, go to sleep
 		int32_t state = TPOOL_LOAD(pool->tasks_available);
-		printf("%d | ready for sleedge\n", tpool_current_thread_idx);
+		if (!pool->running) { break; }
 		_tpool_wait(&pool->tasks_available, state);
-		printf("%d | awake now!\n", tpool_current_thread_idx);
 	}
 
 #ifdef ENABLE_TRACING
@@ -535,10 +516,8 @@ void tpool_wait(TPool *pool) {
 
 	while (TPOOL_LOAD(pool->tasks_left)) {
 
-		printf("%d | trying to grab tasks from our queue\n", tpool_current_thread_idx);
 		// if we've got tasks on our queue, run them
 		while (_tpool_queue_take(current_thread, &task)) {
-			printf("Doing task on %d\n", tpool_current_thread_idx);
 			task.do_work(pool, task.args);
 			TPOOL_ATOMIC_FUTEX_DEC(pool->tasks_left);
 		}
@@ -549,7 +528,6 @@ void tpool_wait(TPool *pool) {
 		// if rem_tasks has changed since we checked last, otherwise the program
 		// will permanently sleep
 		TPool_Futex rem_tasks = TPOOL_LOAD(pool->tasks_left);
-		printf("%d | are there things left? %llx\n", tpool_current_thread_idx, rem_tasks);
 		if (!rem_tasks) {
 			break;
 		}
@@ -557,7 +535,6 @@ void tpool_wait(TPool *pool) {
 		_tpool_wait(&pool->tasks_left, rem_tasks);
 	}
 
-	printf("%d | finished our wait?\n", tpool_current_thread_idx);
 }
 
 void tpool_init(TPool *pool, int child_thread_count) {
@@ -578,7 +555,6 @@ void tpool_init(TPool *pool, int child_thread_count) {
 }
 
 void tpool_destroy(TPool *pool) {
-	printf("Destroying threads\n");
 	pool->running = false;
 	for (int i = 1; i < pool->thread_count; i++) {
 		TPOOL_ATOMIC_FUTEX_INC(pool->tasks_available);
